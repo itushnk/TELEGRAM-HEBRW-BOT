@@ -1,0 +1,33 @@
+
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>ניהול פוסטים</title>
+</head>
+<body>
+    <h2>פוסטים ממתינים</h2>
+    <table border="1">
+        <tr>
+            <th>#</th>
+            <th>תמונה</th>
+            <th>טקסט</th>
+            <th>פעולה</th>
+        </tr>
+        {% for post in posts %}
+        <tr>
+            <td>{{ loop.index0 }}</td>
+            <td><img src="{{ post.ImageURL }}" alt="תמונה" width="100"></td>
+            <td><pre>{{ post.PostText }}</pre></td>
+            <td>
+                <form method="post" action="/update_status">
+                    <input type="hidden" name="index" value="{{ loop.index0 }}">
+                    <button type="submit" name="action" value="approve">✔️ אשר</button>
+                    <button type="submit" name="action" value="reject">❌ דחה</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}
+    </table>
+</body>
+</html>
