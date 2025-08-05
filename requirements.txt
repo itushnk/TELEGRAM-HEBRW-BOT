@@ -1,4 +1,0 @@
-flask==2.3.3
-pandas==2.2.2
-schedule==1.2.1
-python-telegram-bot==20.7
