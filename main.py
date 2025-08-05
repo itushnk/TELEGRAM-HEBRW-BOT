@@ -22,8 +22,8 @@ BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("8301372230:AAFWDmtNw9cbl5qu-7LffO5dSD2HNXcE52E", "")  # חובה ב-ENV
-CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@nisayon121")  # יעד ציבורי ברירת מחדל
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
@@ -1189,3 +1189,75 @@ if __name__ == "__main__":
             wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
             print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
             time.sleep(wait)
+
+
+
+# ========== FLASK WEB UI ==========
+
+from flask import Flask, render_template_string, request, redirect
+import pandas as pd
+
+flask_app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="he">
+<head>
+    <meta charset="UTF-8">
+    <title>פוסטים ממתינים</title>
+</head>
+<body dir="rtl">
+    <h2>פוסטים ממתינים בתור</h2>
+    <form method="post" action="/update_status">
+        <table border="1" cellpadding="5">
+            <tr>
+                <th>#</th>
+                <th>כותרת</th>
+                <th>מחיר</th>
+                <th>סטטוס</th>
+                <th>פעולה</th>
+            </tr>
+            {% for i, post in enumerate(posts) %}
+            <tr>
+                <td>{{ i }}</td>
+                <td>{{ post.get('Title', '') }}</td>
+                <td>{{ post.get('SalePrice', '') }} ₪</td>
+                <td>{{ post.get('Status', 'pending') }}</td>
+                <td>
+                    <button name="index" value="{{ i }}:approve">✔️ אשר</button>
+                    <button name="index" value="{{ i }}:reject">❌ דחה</button>
+                </td>
+            </tr>
+            {% endfor %}
+        </table>
+    </form>
+</body>
+</html>
+"""
+
+@flask_app.route('/')
+def index():
+    if not os.path.exists(PENDING_CSV):
+        return "קובץ התור לא נמצא."
+    df = pd.read_csv(PENDING_CSV, encoding="utf-8")
+    df['Status'] = df.get('Status', 'pending')
+    return render_template_string(HTML_TEMPLATE, posts=df.to_dict(orient='records'))
+
+@flask_app.route('/update_status', methods=['POST'])
+def update_status():
+    raw = request.form.get('index', '')
+    if ':' not in raw:
+        return redirect('/')
+    index_str, status = raw.split(':', 1)
+    try:
+        index = int(index_str)
+    except ValueError:
+        return redirect('/')
+    df = pd.read_csv(PENDING_CSV, encoding="utf-8")
+    if 0 <= index < len(df):
+        df.loc[index, 'Status'] = status
+        df.to_csv(PENDING_CSV, index=False, encoding="utf-8")
+    return redirect('/')
+
+def run_flask():
+    flask_app.run(host='0.0.0.0', port=8080, debug=False)
