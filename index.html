@@ -1,32 +1,27 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html lang="he">
-<head>
-    <meta charset="UTF-8">
+  <head>
+    <meta charset="utf-8">
     <title>ניהול פוסטים</title>
-</head>
-<body>
+    <style>
+      body { font-family: sans-serif; direction: rtl; }
+      .post { border: 1px solid #ccc; margin: 10px; padding: 10px; }
+      img { max-width: 300px; height: auto; display: block; margin-bottom: 10px; }
+    </style>
+  </head>
+  <body>
     <h1>פוסטים ממתינים לאישור</h1>
-    <form method="POST" action="/update_status">
-        <table border="1">
-            <tr>
-                <th>מספר</th>
-                <th>תמונה</th>
-                <th>מלל</th>
-                <th>פעולה</th>
-            </tr>
-            {% for post in posts %}
-            <tr>
-                <td>{{ loop.index0 }}</td>
-                <td><img src="{{ post['ImageURL'] }}" width="100"></td>
-                <td><pre>{{ post['PostText'] }}</pre></td>
-                <td>
-                    <button type="submit" name="index" value="{{ loop.index0 }}" formaction="/update_status?action=approve">✅ אישור</button>
-                    <button type="submit" name="index" value="{{ loop.index0 }}" formaction="/update_status?action=reject">❌ דחייה</button>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
-    </form>
-</body>
+    {% for post in posts %}
+      <div class="post">
+        <p><strong>מספר פריט:</strong> {{ post['ProductId'] }}</p>
+        <p><img src="{{ post['ImageURL'] }}" alt="תמונה"></p>
+        <p>{{ post['PostText']|safe }}</p>
+        <form method="post" action="/update_status">
+          <input type="hidden" name="index" value="{{ loop.index0 }}">
+          <button name="action" value="approve">✅ אשר</button>
+          <button name="action" value="reject">❌ דחה</button>
+        </form>
+      </div>
+    {% endfor %}
+  </body>
 </html>
