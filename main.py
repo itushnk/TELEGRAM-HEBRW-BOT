@@ -9,10 +9,8 @@ import threading
 app = Flask(__name__)
 
 CSV_PATH = "products_queue_managed.csv"
-BOT_TOKEN = os.environ.get("Here is the token for bot בוט כולל תרגום גרסא 22 @hebrew22_bot:
-
-8301372230:AAFWDmtNw9cbl5qu-7LffO5dSD2HNXcE52E")
-CHANNEL_ID = os.environ.get("@NISAYON121")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
 POST_INTERVAL_MINUTES = 20
 
 bot = telegram.Bot(token=BOT_TOKEN)
