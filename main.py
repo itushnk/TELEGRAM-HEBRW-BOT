@@ -1,6 +1,9 @@
 
-import csv
+import os
 import openai
+import csv
+import requests
+import time
 
 # הגדר את מפתח ה־API שלך כאן (או דרך משתנה סביבה)
 openai.api_key = os.getenv("OPENAI_API_KEY")
