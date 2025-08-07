@@ -39,7 +39,7 @@ BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("8301372230:AAFWDmtNw9cbl5qu-7LffO5dSD2HNXcE52E", "")  # חובה ב-ENV
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
