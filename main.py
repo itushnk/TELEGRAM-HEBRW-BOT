@@ -359,18 +359,13 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
-    lines += [
-        price_line,
-        discount_text,
-        f"⭐ דירוג: {rating_percent}",
-        f"📦 {orders_text}",
-        "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
-        "",
-        coupon_text if coupon_text else "",
-        "",
-        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
-        "",
+   price_line = f'💰 מחיר מבצע: <b>{sale_price} ש"ח</b> (מחיר מקורי: {original_price} ש"ח)'
+...
+"👇 להזמנה מהירה לחצו כאן 👇",
+buy_link,
+...
+# ונמחק את שורות "הזמינו עכשיו" ו"לחיצה וזה בדרך"
+,
         f"מספר פריט: {item_id}",
         'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
         "",
