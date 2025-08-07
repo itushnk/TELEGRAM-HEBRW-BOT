@@ -1,22 +1,5 @@
 # -*- coding: utf-8 -*-
 import os, sys
-
-def build_telegram_post(row):
-    opening = item.get("Opening", "").strip()
-    title = item.get("Title", "").strip()
-    strengths = [
-        item.get("Strength1", "").strip(),
-        item.get("Strength2", "").strip(),
-        item.get("Strength3", "").strip()
-    ]
-    strengths = [s for s in strengths if s]
-    post_lines = [
-        f"{opening}",
-        f"{title}",
-    ]
-    post_lines += [f"• {s}" for s in strengths]
-    return "\n".join(post_lines).strip()
-
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -350,7 +333,7 @@ def format_post(product):
     discount = product.get('Discount', '')
     rating = product.get('Rating', '')
     orders = product.get('Orders', '')
-    buy_link = product.get('Promotion Url', '')
+    buy_link = product.get('BuyLink', '')
     coupon = product.get('CouponCode', '')
 
     opening = (product.get('Opening') or '').strip()
@@ -395,7 +378,7 @@ def format_post(product):
         f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
     ]
 
-    post = build_telegram_post(row).join([l for l in lines if l is not None and str(l).strip() != ""])
+    post = "\n".join([l for l in lines if l is not None and str(l).strip() != ""])
     return post, image_url
 
 def post_to_channel(product):
