@@ -3,3 +3,8 @@ pandas
 telebot
 requests
 schedule
+openai
+pyTelegramBotAPI
+requests
+pandas
+python-dotenv
