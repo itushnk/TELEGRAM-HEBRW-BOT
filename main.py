@@ -2,12 +2,12 @@
 import os, sys
 
 def build_telegram_post(row):
-    opening = row.get("Opening", "").strip()
-    title = row.get("Title", "").strip()
+    opening = item.get("Opening", "").strip()
+    title = item.get("Title", "").strip()
     strengths = [
-        row.get("Strength1", "").strip(),
-        row.get("Strength2", "").strip(),
-        row.get("Strength3", "").strip()
+        item.get("Strength1", "").strip(),
+        item.get("Strength2", "").strip(),
+        item.get("Strength3", "").strip()
     ]
     strengths = [s for s in strengths if s]
     post_lines = [
