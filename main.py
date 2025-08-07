@@ -359,7 +359,8 @@ def format_post(product):
                 lines.append(part)
         lines.append("")
 
-   price_line = f"💰 מחיר מבצע: <b>{sale_price} ש\"ח</b> (מחיר מקורי: {original_price} ש\"ח)"
+       price_line = f"💰 מחיר מבצע: <b>{sale_price} ש\"ח</b> (מחיר מקורי: {original_price} ש\"ח)"
+
 
 ...
 "👇 להזמנה מהירה לחצו כאן 👇",
