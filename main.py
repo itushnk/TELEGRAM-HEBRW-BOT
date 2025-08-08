@@ -1386,6 +1386,19 @@ if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 else:
     print("[WARN] מפתח OpenAI לא הוגדר – תרגום לא יהיה זמין.")
+def translate_text_gpt(prompt):
+    api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OpenAI API key is missing.")
+    openai.api_key = api_key
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "אתה מתרגם מומחה לעברית שיווקית"},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message.content.strip()
 
 def translate_missing_fields(csv_path):
     if not OPENAI_API_KEY:
