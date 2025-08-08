@@ -1,1 +1,1 @@
-ItemId,ImageURL,"Title,Opening,Strengths",OriginalPrice,SalePrice,Discount,Rating,Orders,BuyLink,CouponCode,Opening,Strengths,Video Url
+ProductId,ImageURL,VideoURL,ProductDesc,Opening,Title,Strengths,OriginPrice,SalePrice,Discount,Currency,Direct linking commission rate,Estimated direct linking commission,Indirect linking commission rate (%),Estimated indirect linking commission,Sales180Day,Positive Feedback,Promotion Url,Code Name,Code Start Time,Code End Time
