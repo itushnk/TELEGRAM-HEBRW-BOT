@@ -111,7 +111,11 @@ def translate_missing_fields(csv_path):
     else:
         print("✅ אין שורות שדורשות תרגום.")
 
-translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
+csv_files = [f for f in os.listdir(BASE_DIR) if f.endswith('.csv')]
+if csv_files:
+    current_csv = os.path.join(BASE_DIR, csv_files[0])
+    translate_missing_fields(current_csv)
+
 # יעד נוכחי
 CURRENT_TARGET = CHANNEL_ID
 
