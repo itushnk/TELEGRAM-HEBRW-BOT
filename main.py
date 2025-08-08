@@ -53,7 +53,6 @@ SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
 
-translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
 # יעד נוכחי
 CURRENT_TARGET = CHANNEL_ID
 
@@ -1374,3 +1373,7 @@ def translate_missing_fields(csv_path):
         writer.writeheader()
         writer.writerows(updated_rows)
     print("[✓] הסתיים תרגום אוטומטי של שדות חסרים.")
+
+
+if __name__ == "__main__":
+    translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
