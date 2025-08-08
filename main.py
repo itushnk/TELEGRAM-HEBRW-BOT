@@ -7,19 +7,13 @@ from zoneinfo import ZoneInfo
 import openai
 
 # הגדרות כלליות
-BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-try:
-    os.makedirs(BASE_DIR)
-except FileExistsError:
-    pass
-
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")
 ADMIN_USER_IDS = set()
 
-DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")
-PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")
+DATA_CSV = "workfile.csv"
+DATA_CSV = os.path.join(BASE_DIR, "pending.csv")
 USD_TO_ILS_RATE_DEFAULT = 3.55
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -100,4 +94,4 @@ def translate_missing_fields(csv_path):
 
 if __name__ == "__main__":
     print("🚀 התחלת הרצה...")
-    translate_missing_fields(PENDING_CSV)
+    translate_missing_fields(DATA_CSV)
