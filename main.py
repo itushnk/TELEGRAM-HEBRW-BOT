@@ -1308,3 +1308,67 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
+
+
+# ========= AI TRANSLATION VIA OPENAI =========
+import openai
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+else:
+    print("[WARN] מפתח OpenAI לא הוגדר – תרגום לא יהיה זמין.")
+
+def translate_missing_fields(csv_path):
+    if not OPENAI_API_KEY:
+        print("[ERROR] אין מפתח OpenAI – דילוג על תרגום.")
+        return
+
+    updated_rows = []
+    with open(csv_path, 'r', encoding='utf-8', newline='') as infile:
+        reader = list(csv.DictReader(infile))
+        fieldnames = reader[0].keys() if reader else []
+        for row in reader:
+            desc = row.get("ProductDesc", "").strip()
+            needs_translation = any(not row.get(col, "").strip() for col in ["Opening", "Title", "Strengths"])
+            if not desc or not needs_translation:
+                updated_rows.append(row)
+                continue
+
+            prompt = f"""
+הפריט הבא מופיע באתר קניות. נא לנסח פוסט שיווקי לטלגרם לפי ההוראות:
+
+1. כתוב משפט פתיחה שיווקי, מצחיק או מגרה שמתאים למוצר (עד 15 מילים, שורת פתיחה בלבד).
+2. כתוב תיאור שיווקי קצר של המוצר (שורה אחת עד שתיים).
+3. הוסף 3 שורות עם יתרונות או תכונות של המוצר, כולל אימוג'ים מתאימים.
+
+הנה תיאור המוצר:
+"""{desc}"""
+"""
+
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-4",
+                    messages=[
+                        {"role": "system", "content": "אתה עוזר שיווקי מומחה בכתיבה שיווקית בעברית"},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.8
+                )
+                reply = response['choices'][0]['message']['content'].strip()
+                lines = [line.strip() for line in reply.splitlines() if line.strip()]
+                row["Opening"] = lines[0] if len(lines) > 0 else ""
+                row["Title"] = lines[1] if len(lines) > 1 else ""
+                row["Strengths"] = "\n".join(lines[2:5]) if len(lines) >= 5 else ""
+                print(f"[AI] שורה עודכנה: {row.get('ProductDesc', '')[:30]}...")
+            except Exception as e:
+                print(f"[ERROR] שגיאה בתרגום AI: {e}")
+            updated_rows.append(row)
+
+    # כתיבה חזרה לקובץ
+    with open(csv_path, 'w', encoding='utf-8', newline='') as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(updated_rows)
+    print("[✓] הסתיים תרגום אוטומטי של שדות חסרים.")
