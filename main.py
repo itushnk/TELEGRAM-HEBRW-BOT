@@ -97,4 +97,4 @@ def translate_missing_fields(csv_path):
 
 if __name__ == "__main__":
     print("🚀 התחלת הרצה...")
-    translate_missing_fields(PENDING_CSV)
+    translate_missing_fields(DATA_CSV)
