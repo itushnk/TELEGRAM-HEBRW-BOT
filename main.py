@@ -50,12 +50,6 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
-
-def within_scheduled_hours():
-    now = datetime.now(IL_TZ).time()
-    return dtime(8, 0) <= now <= dtime(23, 0)
-
-
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
 
@@ -1356,6 +1350,7 @@ def translate_missing_fields(csv_path):
 '''
 
             try:
+                print(f"[GPT] 🧠 מתרגם שורה: {desc[:40]}...")
                 response = openai.ChatCompletion.create(
                     model="gpt-4",
                     messages=[
@@ -1365,12 +1360,14 @@ def translate_missing_fields(csv_path):
                     temperature=0.8
                 )
                 reply = response['choices'][0]['message']['content'].strip()
+                print("[GPT ✅] הצלחה בתרגום!")
                 lines = [line.strip() for line in reply.splitlines() if line.strip()]
                 row["Opening"] = lines[0] if len(lines) > 0 else ""
                 row["Title"] = lines[1] if len(lines) > 1 else ""
                 row["Strengths"] = "\n".join(lines[2:5]) if len(lines) >= 5 else ""
                 print(f"[AI] שורה עודכנה: {row.get('ProductDesc', '')[:30]}...")
             except Exception as e:
+                print(f"[GPT ❌] שגיאה בתרגום: {str(e)}")
                 print(f"[ERROR] שגיאה בתרגום AI: {e}")
             updated_rows.append(row)
 
@@ -1380,3 +1377,7 @@ def translate_missing_fields(csv_path):
         writer.writeheader()
         writer.writerows(updated_rows)
     print("[✓] הסתיים תרגום אוטומטי של שדות חסרים.")
+
+
+if __name__ == "__main__":
+    translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
