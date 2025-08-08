@@ -56,7 +56,10 @@ IL_TZ = ZoneInfo("Asia/Jerusalem")
 def translate_missing_fields(csv_path):
     import pandas as pd
     import openai
-
+ api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("⚠️ לא נמצא מפתח OpenAI – דילוג על תרגום.", flush=True)
+        return
     df = pd.read_csv(csv_path)
     changed = False
 
