@@ -28,8 +28,7 @@ ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
 DATA_CSV = "workfile.csv"        # קובץ המקור האחרון שהועלה
-PENDING_CSV = "workfile.csv"
-      # תור הפוסטים
+PENDING_CSV = os.path.join(BASE_DIR, "products_queue_managed.csv")  # תור הפוסטים
 DELAY_FILE = os.path.join(BASE_DIR, "post_delay.txt")    # מרווח שידור
 PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
@@ -601,7 +600,7 @@ def delete_source_csv_file():
 
 def delete_source_rows_from_pending():
     """
-    קורא את workfile.csv ומסיר מהתור (pending.csv) את כל הרשומות שנוספו ממנו,
+    קורא את workfile.csv ומסיר מהתור (products_queue_managed.csv) את כל הרשומות שנוספו ממנו,
     לפי אותו מפתח מניעת-כפילויות (ItemId/Title/BuyLink).
     """
     with FILE_LOCK:
