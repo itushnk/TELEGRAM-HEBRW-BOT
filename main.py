@@ -52,6 +52,8 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
+
+translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
 # יעד נוכחי
 CURRENT_TARGET = CHANNEL_ID
 
