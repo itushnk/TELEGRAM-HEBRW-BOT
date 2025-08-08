@@ -1,9 +1,6 @@
+קובץ זה כולל את הקוד המלא של הבוט כולל שיפורי תרגום וטעינת CSV:
+- העלה קובץ CSV עם העמודות הקבועות (כולל Product Desc, Opening, Title, Strengths).
+- הבוט יתרגם אוטומטית שורות שלא כוללות טקסט בשדות Opening, Title, Strengths.
+- לאחר מכן הפוסטים יישלחו לפי ההגדרות שלך.
 
-📦 הוראות התקנה לפרויקט
-
-1. העלה את כל הקבצים לגיטהאב לתוך ריפוזיטורי חדש (כולל תיקיית templates).
-2. חבר את הגיטהאב ל-Railway.
-3. ודא ש-Railway מריץ את main.py אוטומטית.
-4. כדי להיכנס לממשק ניהול הפוסטים, היכנס לכתובת שה-Railway סיפק (למשל https://your-project.up.railway.app).
-
-בהצלחה!
+הקפד להגדיר את משתנה הסביבה OPENAI_API_KEY כראוי ב־Railway.
