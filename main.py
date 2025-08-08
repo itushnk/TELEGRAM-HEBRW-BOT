@@ -8,8 +8,10 @@ import openai
 
 # הגדרות כלליות
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-if not os.path.isdir(BASE_DIR):
+try:
     os.makedirs(BASE_DIR)
+except FileExistsError:
+    pass
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
