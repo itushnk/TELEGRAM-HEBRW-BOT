@@ -52,6 +52,63 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
+def translate_missing_fields(csv_path):
+    import pandas as pd
+    import openai
+
+    df = pd.read_csv(csv_path)
+    changed = False
+
+    for i, row in df.iterrows():
+        desc = row.get("Product Desc", "")
+        opening = str(row.get("Opening", "")).strip()
+        title = str(row.get("Title", "")).strip()
+        strengths = str(row.get("Strengths", "")).strip()
+
+        if desc and (not opening or not title or not strengths):
+            prompt = f"""
+            תרגם את התיאור הבא לפוסט שיווקי בעברית עבור טלגרם:
+            ---
+            {desc}
+            ---
+            כתוב פתיח שיווקי קצר לעמודת Opening.
+            כתוב תיאור מוצר מקוצר לעמודת Title.
+            כתוב שלוש נקודות חוזקה בעמודת Strengths (עם אימוג'ים).
+
+            ענה רק בפורמט הבא (הפרד בשורת רווח בין כל חלק):
+            Opening: ...
+            Title: ...
+            Strengths: ...
+            """
+
+            try:
+                response = openai.ChatCompletion.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7
+                )
+                reply = response.choices[0].message.content.strip()
+
+                # חילוץ הערכים
+                for line in reply.splitlines():
+                    if line.startswith("Opening:"):
+                        df.at[i, "Opening"] = line.replace("Opening:", "").strip()
+                        changed = True
+                    elif line.startswith("Title:"):
+                        df.at[i, "Title"] = line.replace("Title:", "").strip()
+                        changed = True
+                    elif line.startswith("Strengths:"):
+                        df.at[i, "Strengths"] = line.replace("Strengths:", "").strip()
+                        changed = True
+
+            except Exception as e:
+                print(f"שגיאה בתרגום שורה {i}: {e}")
+
+    if changed:
+        df.to_csv(csv_path, index=False)
+        print("💾 שורות מתורגמות נשמרו.")
+    else:
+        print("✅ אין שורות שדורשות תרגום.")
 
 translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
 # יעד נוכחי
