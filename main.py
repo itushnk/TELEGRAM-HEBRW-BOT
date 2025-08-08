@@ -8,7 +8,8 @@ import openai
 
 # הגדרות כלליות
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-os.makedirs(BASE_DIR, exist_ok=True)
+if not os.path.isdir(BASE_DIR):
+    os.makedirs(BASE_DIR)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -97,4 +98,4 @@ def translate_missing_fields(csv_path):
 
 if __name__ == "__main__":
     print("🚀 התחלת הרצה...")
-    translate_missing_fields(DATA_CSV)
+    translate_missing_fields(PENDING_CSV)
