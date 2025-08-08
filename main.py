@@ -1,76 +1,4 @@
 # -*- coding: utf-8 -*-
-import os, sys, csv, requests, time, telebot, threading, socket, re
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from telebot import types
-
-import openai
-openai.api_key = os.getenv("OPENAI_API_KEY")
-api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
-
-# ========= PERSISTENT DATA DIR =========
-BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-os.makedirs(BASE_DIR, exist_ok=True)
-
-# ========= FIND ANY CSV FILE IN DATA =========
-DATA_CSV = None
-for fname in os.listdir(BASE_DIR):
-    if fname.endswith(".csv"):
-        DATA_CSV = os.path.join(BASE_DIR, fname)
-        break
-
-if not DATA_CSV:
-    raise FileNotFoundError("❌ לא נמצא קובץ CSV בתיקייה.")
-
-PENDING_CSV = os.path.join(BASE_DIR, "products_queue_managed.csv")
-
-# ========= FUNCTION TO DETECT TRANSLATION NEEDED =========
-def is_translation_needed(row):
-    return not row.get("Opening") or not row.get("Title") or not row.get("Strengths")
-
-# ========= TRANSLATION FUNCTION (ONLY IF NEEDED) =========
-def translate_missing_rows():
-    import pandas as pd
-    df = pd.read_csv(DATA_CSV)
-
-    for idx, row in df.iterrows():
-        if is_translation_needed(row):
-            prompt = f"""כתוב פוסט בעברית על פי התיאור הבא:
-            תיאור: {row.get("ProductDesc", "")}
-            כתוב:
-            - פתיחה שיווקית שנונה בעברית עם אימוג'י
-            - תיאור קצר (שורה)
-            - שלוש נקודות חוזק עם אימוג'י, כל שורה לבד
-            """
-            try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "אתה כותב תוכן שיווקי לעסק בעברית"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.7,
-                    max_tokens=300
-                )
-                text = response.choices[0].message.content.strip()
-                lines = text.split("\n")
-                if len(lines) >= 5:
-                    df.at[idx, "Opening"] = lines[0].strip()
-                    df.at[idx, "Title"] = lines[1].strip()
-                    df.at[idx, "Strengths"] = "\n".join([l.strip() for l in lines[2:5]])
-
-            except Exception as e:
-                print(f"❌ שגיאה בתרגום שורה {idx}: {e}")
-
-    df.to_csv(DATA_CSV, index=False)
-    print("✅ הסתיים תרגום שורות חסרות.")
-
-# ========= CALL TRANSLATION IF NEEDED =========
-translate_missing_rows()
-
-# ========== המשך הקוד (פרסום וכו') ממשיך כאן ==========
-# ודא שאתה משלב בהמשך את הפונקציות שמפרסמות את הפוסטים על פי הקובץ החדש
-# -*- coding: utf-8 -*-
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
@@ -78,6 +6,16 @@ try:
 except Exception:
     pass
 
+import csv
+import requests
+import time
+import telebot
+from telebot import types
+import threading
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+import socket
+import re
 
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = "."
@@ -118,7 +56,7 @@ IL_TZ = ZoneInfo("Asia/Jerusalem")
 def translate_missing_fields(csv_path):
     import pandas as pd
     import openai
- api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
+    api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
     if not api_key:
         print("⚠️ לא נמצא מפתח OpenAI – דילוג על תרגום.", flush=True)
         return
