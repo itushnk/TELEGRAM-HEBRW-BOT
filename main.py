@@ -1,4 +1,4 @@
-# -*- coding: u# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os, sys, csv, requests, time, telebot, threading, socket, re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
