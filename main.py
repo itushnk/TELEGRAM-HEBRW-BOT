@@ -78,17 +78,6 @@ try:
 except Exception:
     pass
 
-import csv
-import requests
-import time
-import telebot
-from telebot import types
-import threading
-from datetime import datetime, timedelta, time as dtime
-from zoneinfo import ZoneInfo
-import socket
-import re
-
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = "."
 
