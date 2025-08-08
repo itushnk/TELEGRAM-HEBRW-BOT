@@ -70,13 +70,14 @@ translate_missing_rows()
 
 # ========== המשך הקוד (פרסום וכו') ממשיך כאן ==========
 # ודא שאתה משלב בהמשך את הפונקציות שמפרסמות את הפוסטים על פי הקובץ החדש
-tf-8 -*-
+# -*- coding: utf-8 -*-
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
+
 
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = "."
