@@ -18,8 +18,8 @@ import socket
 import re
 
 # ========= PERSISTENT DATA DIR =========
-BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-os.makedirs(BASE_DIR, exist_ok=True)
+BASE_DIR = "."
+
 
 # ========= CONFIG =========
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
@@ -27,8 +27,8 @@ CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציב�
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
-DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
-PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")      # תור הפוסטים
+DATA_CSV = "workfile.csv"        # קובץ המקור האחרון שהועלה
+PENDING_CSV = "pending.csv"      # תור הפוסטים
 DELAY_FILE = os.path.join(BASE_DIR, "post_delay.txt")    # מרווח שידור
 PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
 PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
