@@ -1338,7 +1338,7 @@ def translate_missing_fields(csv_path):
                 updated_rows.append(row)
                 continue
 
-            prompt = f"""
+            prompt = f'''
 הפריט הבא מופיע באתר קניות. נא לנסח פוסט שיווקי לטלגרם לפי ההוראות:
 
 1. כתוב משפט פתיחה שיווקי, מצחיק או מגרה שמתאים למוצר (עד 15 מילים, שורת פתיחה בלבד).
@@ -1346,8 +1346,8 @@ def translate_missing_fields(csv_path):
 3. הוסף 3 שורות עם יתרונות או תכונות של המוצר, כולל אימוג'ים מתאימים.
 
 הנה תיאור המוצר:
-"""{desc}"""
-"""
+"{desc}"
+'''
 
             try:
                 response = openai.ChatCompletion.create(
