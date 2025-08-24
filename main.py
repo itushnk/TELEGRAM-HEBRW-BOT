@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
-import os, sys, time
-print("🚀 Booting Telegram bot...", flush=True)
-print(f"PWD={os.getcwd()}", flush=True)
-print(f"FILES={os.listdir('.')}", flush=True)
-print(f"HAS_TOKEN={'TELEGRAM_BOT_TOKEN' in os.environ}", flush=True)
-
+import os, sys
+os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
