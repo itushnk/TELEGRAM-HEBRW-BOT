@@ -50,7 +50,16 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
-# === Affiliates Inline Panel (init) ===
+# === Affiliates Inline Panel (imports) ===
+try:
+    from telebot import types as _tb_types  # alias to avoid collision
+    from aliexpress_affiliate import AliExpressAffiliateClient
+    import time as _time_aff
+except Exception as _e_imp_aff:
+    print(f"[WARN] Affiliates imports issue: {_e_imp_aff}", flush=True)
+    _tb_types = None
+    AliExpressAffiliateClient = None
+
 try:
     AE = AliExpressAffiliateClient()  # Uses ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
 except Exception as e:
