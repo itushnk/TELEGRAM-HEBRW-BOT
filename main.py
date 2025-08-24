@@ -22,7 +22,7 @@ BASE_DIR = "."
 
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("8301372230:AAGgrWQNXR_1fuPTkvZUfQGUIVLCPduWh40", "")  # חובה ב-ENV
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
@@ -50,16 +50,7 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
-# === Affiliates Inline Panel (imports) ===
-try:
-    from telebot import types as _tb_types  # alias to avoid collision
-    from aliexpress_affiliate import AliExpressAffiliateClient
-    import time as _time_aff
-except Exception as _e_imp_aff:
-    print(f"[WARN] Affiliates imports issue: {_e_imp_aff}", flush=True)
-    _tb_types = None
-    AliExpressAffiliateClient = None
-
+# === Affiliates Inline Panel (init) ===
 try:
     AE = AliExpressAffiliateClient()  # Uses ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
 except Exception as e:
