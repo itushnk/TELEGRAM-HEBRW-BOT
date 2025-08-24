@@ -168,15 +168,6 @@ def acquire_single_instance_lock(lock_path: str):
             return f
         else:
             import fcntl
-# === Affiliates Inline Panel (imports) ===
-try:
-    from telebot import types as _tb_types  # alias to avoid collision
-    from aliexpress_affiliate import AliExpressAffiliateClient
-    import time as _time_aff
-except Exception as _e_imp_aff:
-    print(f"[WARN] Affiliates imports issue: {_e_imp_aff}", flush=True)
-    _tb_types = None
-    AliExpressAffiliateClient = None
             f = open(lock_path, "w")
             try:
                 fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -187,8 +178,6 @@ except Exception as _e_imp_aff:
     except Exception as e:
         print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
         return None
-
-
 # ========= WEBHOOK DIAGNOSTICS =========
 def print_webhook_info():
     try:
