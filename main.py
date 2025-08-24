@@ -22,7 +22,7 @@ BASE_DIR = "."
 
 
 # ========= CONFIG =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
+BOT_TOKEN = os.environ.get("8301372230:AAGgrWQNXR_1fuPTkvZUfQGUIVLCPduWh40", "")  # חובה ב-ENV
 CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
 ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
