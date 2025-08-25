@@ -11,6 +11,10 @@ import requests
 import time
 import telebot
 from telebot import types
+# === Affiliates Inline Panel (imports) ===
+from telebot import types as _tb_types
+from aliexpress_affiliate import AliExpressAffiliateClient
+import time as _time_aff
 import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -475,42 +479,23 @@ def format_post(product):
     return post, image_url
 
 def post_to_channel(product):
-
-from urllib.parse import urlparse
-
-def _is_url(u: str) -> bool:
     try:
-        r = urlparse((u or "").strip())
-        return r.scheme in ("http", "https") and bool(r.netloc)
-    except Exception:
-        return False
+        post_text, image_url = format_post(product)
+        video_url = (product.get('Video Url') or "").strip()
+        target = resolve_target(CURRENT_TARGET)
+        if video_url.endswith('.mp4') and video_url.startswith("http"):
+            resp = SESSION.get(video_url, timeout=20)
+            resp.raise_for_status()
+            bot.send_video(target, resp.content, caption=post_text)
+        else:
+            resp = SESSION.get(image_url, timeout=20)
+            resp.raise_for_status()
+            bot.send_photo(target, resp.content, caption=post_text)
+    except Exception as e:
+        print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
 
-post_text, image_url = format_post(product)
-video_url = (product.get('Video Url') or "").strip()
-buy_link = (product.get('BuyLink') or "").strip()
 
-# Validate target chat and URLs
-target = resolve_target(CURRENT_TARGET)
-
-# Require at least a valid buy link (so הפוסט לא יהיה ריק/שבור)
-if not _is_url(buy_link):
-    raise ValueError("Missing/invalid BuyLink URL")
-
-# Prefer video if valid MP4 URL; else use image if valid; else plain text
-if video_url.lower().endswith('.mp4') and _is_url(video_url):
-    resp = SESSION.get(video_url, timeout=20)
-    resp.raise_for_status()
-    bot.send_video(target, resp.content, caption=post_text + "\n" + buy_link)
-    return
-
-if _is_url(image_url):
-    resp = SESSION.get(image_url, timeout=20)
-    resp.raise_for_status()
-    bot.send_photo(target, resp.content, caption=post_text + "\n" + buy_link)
-    return
-
-# Fallback: text-only post
-bot.send_message(target, (post_text + "\n" + buy_link).strip())
+# ========= ATOMIC SEND =========
 def send_next_locked(source: str = "loop") -> bool:
     with FILE_LOCK:
         pending = read_products(PENDING_CSV)
@@ -1375,6 +1360,47 @@ def _debug_log_everything(msg):
 
 
 # ========= MAIN =========
+
+# === Safe override: robust post_to_channel ===
+def post_to_channel(product):
+    from urllib.parse import urlparse
+
+    def _is_url(u: str) -> bool:
+        try:
+            r = urlparse((u or "").strip())
+            return r.scheme in ("http", "https") and bool(r.netloc)
+        except Exception:
+            return False
+
+    post_text, image_url = format_post(product)
+    video_url = (product.get('Video Url') or "").strip()
+    buy_link = (product.get('BuyLink') or "").strip()
+
+    target = resolve_target(CURRENT_TARGET)
+
+    # Require at least a valid buy link so פוסט לא ייצא ריק
+    if not _is_url(buy_link):
+        raise ValueError("Missing/invalid BuyLink URL")
+
+    caption_txt = (post_text + "\n" + buy_link).strip()
+
+    # Prefer MP4 video
+    if video_url.lower().endswith(".mp4") and _is_url(video_url):
+        resp = SESSION.get(video_url, timeout=20)
+        resp.raise_for_status()
+        bot.send_video(target, resp.content, caption=caption_txt)
+        return
+
+    # Else image
+    if _is_url(image_url):
+        resp = SESSION.get(image_url, timeout=20)
+        resp.raise_for_status()
+        bot.send_photo(target, resp.content, caption=caption_txt)
+        return
+
+    # Fallback: text only
+    bot.send_message(target, caption=caption_txt)
+
 if __name__ == "__main__":
     # Single-instance lock
     LOCK_HANDLE = acquire_single_instance_lock(LOCK_PATH)
