@@ -11,6 +11,12 @@ import requests
 import time
 import telebot
 from telebot import types
+# === AliExpress SDK import (guarded) ===
+try:
+    from aliexpress_affiliate import AliExpressAffiliateClient
+except Exception as _ae_imp_err:
+    AliExpressAffiliateClient = None
+    print(f"[WARN] AliExpress module not available: {_ae_imp_err}", flush=True)
 import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -51,12 +57,14 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 # === Affiliates Inline Panel (init) ===
+AE = None
 try:
-    AE = AliExpressAffiliateClient()  # Uses ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
+    if AliExpressAffiliateClient is None:
+        raise RuntimeError("AliExpressAffiliateClient import failed (module not found)")
+    AE = AliExpressAffiliateClient()  # Reads ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
 except Exception as e:
     AE = None
     print(f"[WARN] AliExpress client not initialized: {e}", flush=True)
-
 def _require_ae(_msg_or_chat_id):
     try:
         _chat_id = _msg_or_chat_id.chat.id if hasattr(_msg_or_chat_id, "chat") else _msg_or_chat_id
@@ -1383,6 +1391,70 @@ def _log_target_admin_status(target_str):
     except Exception as e:
         print(f"[TARGET] Could not resolve/inspect target '{target_str}': {e}", flush=True)
         return False
+
+# === Admin callbacks ===
+@bot.callback_query_handler(func=lambda c: c.data == "diag:target")
+def _diag_target_cb(c):
+    try:
+        ok, txt = _get_target_admin_status(CURRENT_TARGET)
+        bot.answer_callback_query(c.id, "בוצע ✅" if ok else "שגיאה", show_alert=False)
+        bot.send_message(c.message.chat.id, txt)
+    except Exception as e:
+        try:
+            bot.answer_callback_query(c.id, "שגיאה", show_alert=False)
+        except Exception:
+            pass
+        bot.send_message(c.message.chat.id, f"❌ שגיאת דיאגנוסטיקה: {e}")
+
+# === Admin inline panel ===
+@bot.message_handler(commands=['admin', 'diag'])
+def _admin_panel_cmd(msg):
+    # require admin if helper exists
+    try:
+        chk = _is_admin(msg)
+        if chk is False:
+            return
+    except Exception:
+        pass
+
+    try:
+        kb = _tb_types.InlineKeyboardMarkup(row_width=1) if _tb_types else None
+        if kb:
+            kb.add(_tb_types.InlineKeyboardButton("בדיקת יעד 📡", callback_data="diag:target"))
+        bot.send_message(msg.chat.id, "לוח מנהל:", reply_markup=kb)
+    except Exception as e:
+        bot.send_message(msg.chat.id, f"❌ לא ניתן לפתוח לוח מנהל: {e}")
+
+# === Target diagnostics (message-friendly) ===
+def _get_target_admin_status(target_str):
+    try:
+        # Resolve target; accept @username or numeric id
+        try:
+            tgt = resolve_target(target_str) if 'resolve_target' in globals() else target_str
+        except Exception:
+            tgt = target_str
+        chat = bot.get_chat(tgt)
+        me = bot.get_me()
+        try:
+            admins = bot.get_chat_administrators(chat.id)
+            is_admin = any(getattr(a, "user", None) and a.user.id == me.id for a in admins)
+        except Exception:
+            admins = []
+            is_admin = False
+
+        title = getattr(chat, "title", None) or (("@" + chat.username) if getattr(chat, "username", None) else str(chat.id))
+        lines = [
+            "📡 דיאגנוסטיקת יעד",
+            f"• Chat ID: <code>{chat.id}</code>",
+            f"• Title/Username: <b>{title}</b>",
+            f"• Bot Admin: {'✅ כן' if is_admin else '❌ לא'}"
+        ]
+        tip = ""
+        if not is_admin:
+            tip = "\nℹ️ כדי לפרסם לערוץ, הבוט חייב להיות מנהל. אחרת תופיע שגיאת 400 (chat not found)."
+        return True, "\n".join(lines) + tip
+    except Exception as e:
+        return False, f"❌ לא ניתן לאמת יעד: {e}"
 
 
 if __name__ == "__main__":
