@@ -49,6 +49,15 @@ if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+
+print("🚀 Booting Telegram bot...", flush=True)
+print(f"PWD={os.getcwd()}", flush=True)
+try:
+    print(f"FILES={os.listdir('.')}", flush=True)
+except Exception:
+    pass
+print(f"HAS_BOT_TOKEN={'BOT_TOKEN' in os.environ}", flush=True)
 SESSION = requests.Session()
 # === Affiliates Inline Panel (init) ===
 try:
@@ -1348,326 +1357,19 @@ def _debug_log_everything(msg):
 
 # ========= MAIN =========
 if __name__ == "__main__":
-    print(f"Instance: {socket.gethostname()}", flush=True)
-    try:
-        me = bot.get_me()
-        print(f"Bot: @{me.username} ({me.id})", flush=True)
-    except Exception as e:
-        print("getMe failed:", e, flush=True)
-
-    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
-    if _lock_handle is None:
-        print("Another instance is running (lock failed). Exiting.", flush=True)
+    # Single-instance lock
+    LOCK_HANDLE = acquire_single_instance_lock(LOCK_PATH)
+    if LOCK_HANDLE is None:
+        print("Another instance is running. Exiting.", flush=True)
         sys.exit(1)
 
-    print_webhook_info()
+    # Disable webhook to avoid 409 conflicts when using polling
     try:
-        force_delete_webhook()
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        try:
-            bot.remove_webhook()
-        except Exception as e2:
-            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
-    print_webhook_info()
-
-    t = threading.Thread(target=auto_post_loop, daemon=True)
-    t.start()
-
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            msg = str(e)
-            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
-            time.sleep(wait)
-
-
-@bot.message_handler(commands=['toggle_mode'])
-def toggle_mode(msg):
-    if not _is_admin(msg):
-        return
-    mode = read_auto_flag()
-    new_mode = "off" if mode == "on" else "on"
-    write_auto_flag(new_mode)
-    bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
-
-
-
-# ========= AI TRANSLATION VIA OPENAI =========
-import openai
-
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-if OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
-else:
-    print("[WARN] מפתח OpenAI לא הוגדר – תרגום לא יהיה זמין.")
-def translate_text_gpt(prompt):
-    api_key = getattr(openai, "api_key", None) or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OpenAI API key is missing.")
-    openai.api_key = api_key
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[
-            {"role": "system", "content": "אתה מתרגם מומחה לעברית שיווקית"},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content.strip()
-
-def translate_missing_fields(csv_path):
-    if not OPENAI_API_KEY:
-        print("[ERROR] אין מפתח OpenAI – דילוג על תרגום.")
-        return
-
-    updated_rows = []
-    with open(csv_path, 'r', encoding='utf-8', newline='') as infile:
-        reader = list(csv.DictReader(infile))
-        fieldnames = reader[0].keys() if reader else []
-        for row in reader:
-            desc = row.get("ProductDesc", "").strip()
-            needs_translation = any(not row.get(col, "").strip() for col in ["Opening", "Title", "Strengths"])
-            if not desc or not needs_translation:
-                updated_rows.append(row)
-                continue
-
-            prompt = f'''
-הפריט הבא מופיע באתר קניות. נא לנסח פוסט שיווקי לטלגרם לפי ההוראות:
-
-1. כתוב משפט פתיחה שיווקי, מצחיק או מגרה שמתאים למוצר (עד 15 מילים, שורת פתיחה בלבד).
-2. כתוב תיאור שיווקי קצר של המוצר (שורה אחת עד שתיים).
-3. הוסף 3 שורות עם יתרונות או תכונות של המוצר, כולל אימוג'ים מתאימים.
-
-הנה תיאור המוצר:
-"{desc}"
-'''
-
-            try:
-                print(f"[GPT] 🧠 מתרגם שורה: {desc[:40]}...")
-                response = openai.ChatCompletion.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "אתה עוזר שיווקי מומחה בכתיבה שיווקית בעברית"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.8
-                )
-                reply = response['choices'][0]['message']['content'].strip()
-                print("[GPT ✅] הצלחה בתרגום!")
-                lines = [line.strip() for line in reply.splitlines() if line.strip()]
-                row["Opening"] = lines[0] if len(lines) > 0 else ""
-                row["Title"] = lines[1] if len(lines) > 1 else ""
-                row["Strengths"] = "\n".join(lines[2:5]) if len(lines) >= 5 else ""
-                print(f"[AI] שורה עודכנה: {row.get('ProductDesc', '')[:30]}...")
-            except Exception as e:
-                print(f"[GPT ❌] שגיאה בתרגום: {str(e)}")
-                print(f"[ERROR] שגיאה בתרגום AI: {e}")
-            updated_rows.append(row)
-
-    # כתיבה חזרה לקובץ
-    with open(csv_path, 'w', encoding='utf-8', newline='') as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(updated_rows)
-    print("[✓] הסתיים תרגום אוטומטי של שדות חסרים.")
-
-
-if __name__ == "__main__":
-    translate_missing_fields(PENDING_CSV)  # הפעלת תרגום אוטומטי לשורות חסרות
-
-# === Affiliates Inline Panel (UI) ===
-def build_aff_panel():
-    kb = _tb_types.InlineKeyboardMarkup(row_width=2) if _tb_types else None
-    if kb is None:
-        return None
-    kb.add(
-        _tb_types.InlineKeyboardButton("בדיקת API ✅", callback_data="aff:test"),
-        _tb_types.InlineKeyboardButton("העשרת CSV 🔗", callback_data="aff:enrich"),
-    )
-    kb.add(
-        _tb_types.InlineKeyboardButton("דילים חמים 🔥", callback_data="aff:hot")
-    )
-    return kb
-
-@bot.message_handler(commands=['aff','aff_panel'])
-def aff_panel_cmd(msg):
-    if not _is_admin(msg):
-        return
-    if not _require_ae(msg):
-        return
-    kb = build_aff_panel()
-    bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=kb)
-
-
-# === Affiliates Inline Panel (callbacks) ===
-@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("aff:"))
-def aff_callbacks(c):
-    if not _is_admin(c.message):
-        return bot.answer_callback_query(c.id, "אין הרשאה")
-    if not _require_ae(c.message):
-        return bot.answer_callback_query(c.id, "API לא מאותחל")
-
-    data = c.data
-    if data == "aff:test":
-        return _aff_do_test(c)
-    if data == "aff:enrich":
-        return _aff_do_enrich(c)
-    if data == "aff:hot":
-        return _aff_ask_hot_params(c)
-
-def _aff_do_test(c):
-    try:
-        AE.query_products(keywords="test", page_no=1, page_size=1)
-        bot.answer_callback_query(c.id, "בדיקה הצליחה ✅", show_alert=False)
-        bot.send_message(c.message.chat.id, "✅ AliExpress API מחובר ועובד (חתימה/ENV תקינים).", reply_markup=build_aff_panel())
+        bot.remove_webhook()
+        time.sleep(1)
     except Exception as e:
-        bot.answer_callback_query(c.id, "שגיאה", show_alert=False)
-        bot.send_message(c.message.chat.id, f"❌ בדיקת API נכשלה: {e}")
+        print(f"[WARN] remove_webhook failed: {e}", flush=True)
 
-def _aff_do_enrich(c):
-    try:
-        in_path = globals().get('DATA_CSV', 'data/workfile.csv')
-        out_path = in_path  # in-place
-        changed = AE.enrich_csv(in_path, out_path, rate_limit_sec=0.6)
-
-        if 'merge_from_data_into_pending' in globals():
-            added, already, total_after = merge_from_data_into_pending()
-            txt = (f"✅ העשרה הושלמה.\nעודכנו {changed} שורות.\n"
-                   f"נוספו לתור: {added} | כפולים: {already} | סה״כ בתור: {total_after}")
-        else:
-            txt = f"✅ העשרה הושלמה (עודכנו {changed} שורות) — merge לתור לא זמין."
-
-        bot.answer_callback_query(c.id, "בוצע ✅", show_alert=False)
-        bot.edit_message_text(txt, c.message.chat.id, c.message.message_id, reply_markup=build_aff_panel())
-    except Exception as e:
-        bot.answer_callback_query(c.id, "שגיאה", show_alert=False)
-        bot.send_message(c.message.chat.id, f"❌ שגיאה בהעשרה: {e}")
-
-def _aff_ask_hot_params(c):
-    kb = _tb_types.InlineKeyboardMarkup() if _tb_types else None
-    if kb:
-        for kw in ("Bluetooth", "Headphones", "Power Bank", "LED Light"):
-            kb.add(_tb_types.InlineKeyboardButton(f"{kw} ×10", callback_data=f"aff:hot_go:{kw}:10"))
-    msg = bot.send_message(
-        c.message.chat.id,
-        "שלח/י מילת מפתח וכמות, למשל:\n`Bluetooth 10`\n\nאו הקש על אחד המקצרים:",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
-    bot.answer_callback_query(c.id)
-
-@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("aff:hot_go:"))
-def _aff_hot_go_cb(c):
-    _, _, kw, cnt_str = c.data.split(":", 3)
-    try:
-        count = int(cnt_str)
-    except:
-        count = 10
-    _aff_do_hot(c.message.chat.id, kw, count)
-    bot.answer_callback_query(c.id)
-
-@bot.message_handler(func=lambda m: m.text and any(m.text.lower().startswith(p) for p in ("/hot ", "/aff_hot ")) is False)
-def _aff_hot_free_text(m):
-    if not _is_admin(m):
-        return
-    text = m.text.strip()
-    if any(w in text.lower() for w in ("bluetooth", "headphones", "power", "led")) and any(ch.isdigit() for ch in text):
-        parts = text.replace("|", " ").split()
-        kw = " ".join(p for p in parts if not p.isdigit()) or "Bluetooth"
-        nums = [int(p) for p in parts if p.isdigit()]
-        count = nums[0] if nums else 10
-        if AE is None:
-            return bot.reply_to(m, "❌ API לא מאותחל. ודא ENV.")
-        _aff_do_hot(m.chat.id, kw, count)
-
-def _aff_do_hot(chat_id, keyword: str, count: int):
-    if AE is None:
-        return bot.send_message(chat_id, "❌ API לא מאותחל. ודא ENV.")
-    try:
-        items, page = [], 1
-        while len(items) < count and page < 50:
-            batch = AE.query_products(
-                keywords=keyword,
-                page_no=page,
-                page_size=min(20, count - len(items)),
-                min_discount=40,
-                min_rating=4.6
-            )
-            if not batch:
-                break
-            items.extend(batch)
-            page += 1
-            _time_aff.sleep(0.3)
-
-        if not items:
-            return bot.send_message(chat_id, f"לא נמצאו פריטים עבור '{keyword}'.")
-
-        mapped = []
-        for p in items:
-            try:
-                promo = AE.generate_affiliate_link(p["detail_url"]) or p["detail_url"]
-                rating_pct = f"{round(float(p.get('rating', 0.0)) * 20, 1)}%" if p.get("rating") else ""
-                mapped.append({
-                    "ItemId": str(p.get("product_id", "")),
-                    "ImageURL": p.get("image", ""),
-                    "Title": p.get("title", ""),
-                    "OriginalPrice": p.get("orig_price", ""),
-                    "SalePrice": p.get("sale_price", ""),
-                    "Discount": p.get("discount", ""),
-                    "Rating": rating_pct,
-                    "Orders": p.get("orders", ""),
-                    "BuyLink": promo,
-                    "CouponCode": "",
-                    "Opening": "",
-                    "Video Url": "",
-                    "Strengths": "",
-                })
-                _time_aff.sleep(0.15)
-            except Exception:
-                continue
-
-        DATA_CSV = globals().get('DATA_CSV', 'data/workfile.csv')
-        PENDING_CSV = globals().get('PENDING_CSV', 'data/pending.csv')
-
-        if not all(name in globals() for name in ('FILE_LOCK','read_products','write_products')):
-            import csv, os
-            os.makedirs("data", exist_ok=True)
-            out_path = "data/hot.csv"
-            headers = ["ItemId","ImageURL","Title","OriginalPrice","SalePrice","Discount","Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths"]
-            with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=headers)
-                w.writeheader(); w.writerows(mapped)
-            return bot.send_message(chat_id, f"✅ נמצאו {len(mapped)} פריטים. נשמרו ל־{out_path} (פונקציות תור לא אותרו).")
-
-        with FILE_LOCK:
-            pending_rows = read_products(PENDING_CSV)
-
-            def key_of(r):
-                item_id = (r.get("ItemId") or "").strip()
-                title = (r.get("Title") or "").strip()
-                buy = (r.get("BuyLink") or "").strip()
-                return (item_id if item_id else None, title if not item_id else None, buy)
-
-            existing = {key_of(r) for r in pending_rows}
-            added = 0
-            for r in mapped:
-                k = key_of(r)
-                if k in existing:
-                    continue
-                pending_rows.append(r)
-                existing.add(k)
-                added += 1
-
-            write_products(PENDING_CSV, pending_rows)
-            total_after = len(pending_rows)
-
-        kb = _tb_types.InlineKeyboardMarkup() if _tb_types else None
-        if kb:
-            kb.add(_tb_types.InlineKeyboardButton("עוד דילים 🔁", callback_data="aff:hot"),
-                   _tb_types.InlineKeyboardButton("לוח בקרה ↩️", callback_data="aff:test"))
-        bot.send_message(chat_id, f"✅ נוספו לתור {added} פריטים חדשים ({len(items)} נמצאו) עבור '{keyword}'.\nסה״כ בתור: {total_after}", reply_markup=kb)
-
-    except Exception as e:
-        bot.send_message(chat_id, f"❌ שגיאה בשליפת דילים: {e}")
+    print("🚀 starting polling...", flush=True)
+    # Use robust infinity_polling with timeouts and skip pending updates
+    bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
