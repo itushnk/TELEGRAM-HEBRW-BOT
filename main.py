@@ -11,12 +11,6 @@ import requests
 import time
 import telebot
 from telebot import types
-# === AliExpress SDK import (guarded) ===
-try:
-    from aliexpress_affiliate import AliExpressAffiliateClient
-except Exception as _ae_imp_err:
-    AliExpressAffiliateClient = None
-    print(f"[WARN] AliExpress module not available: {_ae_imp_err}", flush=True)
 import threading
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
@@ -44,12 +38,17 @@ PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 
+# Auto-fetcher
+AUTO_FETCH_FLAG_FILE = os.path.join(BASE_DIR, "auto_fetch.enabled")
+KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.txt")
+
 # שער ברירת מחדל
 USD_TO_ILS_RATE_DEFAULT = 3.55
 
 # נעילה למופע יחיד
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
+import ae_autofetcher
 # ========= INIT =========
 if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
@@ -57,14 +56,12 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
 # === Affiliates Inline Panel (init) ===
-AE = None
 try:
-    if AliExpressAffiliateClient is None:
-        raise RuntimeError("AliExpressAffiliateClient import failed (module not found)")
-    AE = AliExpressAffiliateClient()  # Reads ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
+    AE = AliExpressAffiliateClient()  # Uses ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
 except Exception as e:
     AE = None
     print(f"[WARN] AliExpress client not initialized: {e}", flush=True)
+
 def _require_ae(_msg_or_chat_id):
     try:
         _chat_id = _msg_or_chat_id.chat.id if hasattr(_msg_or_chat_id, "chat") else _msg_or_chat_id
@@ -163,6 +160,7 @@ FILE_LOCK = threading.Lock()
 
 
 # ========= SINGLE INSTANCE LOCK =========
+
 def acquire_single_instance_lock(lock_path: str):
     try:
         if os.name == "nt":
@@ -186,16 +184,6 @@ def acquire_single_instance_lock(lock_path: str):
     except Exception as e:
         print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
         return None
-
-# === Affiliates Inline Panel (imports) ===
-try:
-    from telebot import types as _tb_types  # alias to avoid collision
-    from aliexpress_affiliate import AliExpressAffiliateClient
-    import time as _time_aff
-except Exception as _e_imp_aff:
-    print(f"[WARN] Affiliates imports issue: {_e_imp_aff}", flush=True)
-    _tb_types = None
-    AliExpressAffiliateClient = None
 
 
 # ========= WEBHOOK DIAGNOSTICS =========
@@ -1367,94 +1355,80 @@ def _debug_log_everything(msg):
 
 
 # ========= MAIN =========
-# === Target diagnostics ===
-def _log_target_admin_status(target_str):
+# === Auto-fetcher commands ===
+@bot.message_handler(commands=['auto_on'])
+def _auto_on(msg):
     try:
-        # Resolve target; accept @username or numeric id
+        # admin gate if available
         try:
-            tgt = resolve_target(target_str) if 'resolve_target' in globals() else target_str
-        except Exception:
-            tgt = target_str
-        chat = bot.get_chat(tgt)
-        me = bot.get_me()
-        try:
-            admins = bot.get_chat_administrators(chat.id)
-            is_admin = any(getattr(a, "user", None) and a.user.id == me.id for a in admins)
-        except Exception:
-            admins = []
-            is_admin = False
-        title = getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat.id)
-        print(f"[TARGET] Resolved target → id={chat.id} | title={title} | bot_is_admin={is_admin}", flush=True)
-        if not is_admin:
-            print("[TARGET] WARNING: bot is NOT admin in target. Posting to channels requires admin rights; otherwise you'll see 400 'chat not found'.", flush=True)
-        return True
-    except Exception as e:
-        print(f"[TARGET] Could not resolve/inspect target '{target_str}': {e}", flush=True)
-        return False
-
-# === Admin callbacks ===
-@bot.callback_query_handler(func=lambda c: c.data == "diag:target")
-def _diag_target_cb(c):
-    try:
-        ok, txt = _get_target_admin_status(CURRENT_TARGET)
-        bot.answer_callback_query(c.id, "בוצע ✅" if ok else "שגיאה", show_alert=False)
-        bot.send_message(c.message.chat.id, txt)
-    except Exception as e:
-        try:
-            bot.answer_callback_query(c.id, "שגיאה", show_alert=False)
+            if not _is_admin(msg):
+                return
         except Exception:
             pass
-        bot.send_message(c.message.chat.id, f"❌ שגיאת דיאגנוסטיקה: {e}")
+        open(AUTO_FETCH_FLAG_FILE, "w").close()
+        ae_autofetcher.ensure_keywords_file(KEYWORDS_FILE)
+        bot.reply_to(msg, "✅ Auto-fetch הופעל. אפשר לערוך מילים בקובץ keywords.txt. (המחזור הבא יתקיים תוך דקות)")
+    except Exception as e:
+        bot.reply_to(msg, f"❌ כשל בהפעלת Auto-fetch: {e}")
 
-# === Admin inline panel ===
-@bot.message_handler(commands=['admin', 'diag'])
-def _admin_panel_cmd(msg):
-    # require admin if helper exists
+@bot.message_handler(commands=['auto_off'])
+def _auto_off(msg):
     try:
-        chk = _is_admin(msg)
-        if chk is False:
+        try:
+            if not _is_admin(msg):
+                return
+        except Exception:
+            pass
+        if os.path.exists(AUTO_FETCH_FLAG_FILE):
+            os.remove(AUTO_FETCH_FLAG_FILE)
+        bot.reply_to(msg, "⏸️ Auto-fetch כובה.")
+    except Exception as e:
+        bot.reply_to(msg, f"❌ כשל בכיבוי Auto-fetch: {e}")
+
+@bot.message_handler(commands=['auto_status'])
+def _auto_status(msg):
+    try:
+        enabled = os.path.exists(AUTO_FETCH_FLAG_FILE)
+        kws = ae_autofetcher.read_keywords(KEYWORDS_FILE)
+        txt = f"📡 Auto-fetch: {'✅ פעיל' if enabled else '⏸️ כבוי'}\nמילות מפתח ({len(kws)}): " + (', '.join(kws[:10]) if kws else '—')
+        bot.reply_to(msg, txt)
+    except Exception as e:
+        bot.reply_to(msg, f"❌ שגיאה: {e}")
+
+@bot.message_handler(commands=['auto_add'])
+def _auto_add(msg):
+    try:
+        try:
+            if not _is_admin(msg):
+                return
+        except Exception:
+            pass
+        parts = (msg.text or "").split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            bot.reply_to(msg, "השתמש: /auto_add <keyword>")
             return
-    except Exception:
-        pass
-
-    try:
-        kb = _tb_types.InlineKeyboardMarkup(row_width=1) if _tb_types else None
-        if kb:
-            kb.add(_tb_types.InlineKeyboardButton("בדיקת יעד 📡", callback_data="diag:target"))
-        bot.send_message(msg.chat.id, "לוח מנהל:", reply_markup=kb)
+        kw = parts[1].strip()
+        ks = ae_autofetcher.read_keywords(KEYWORDS_FILE)
+        if kw in ks:
+            bot.reply_to(msg, f"'{kw}' כבר קיים.")
+            return
+        with open(KEYWORDS_FILE, "a", encoding="utf-8") as f:
+            f.write("\n" + kw)
+        bot.reply_to(msg, f"✅ נוסף: {kw}")
     except Exception as e:
-        bot.send_message(msg.chat.id, f"❌ לא ניתן לפתוח לוח מנהל: {e}")
+        bot.reply_to(msg, f"❌ שגיאה: {e}")
 
-# === Target diagnostics (message-friendly) ===
-def _get_target_admin_status(target_str):
+@bot.message_handler(commands=['auto_list'])
+def _auto_list(msg):
     try:
-        # Resolve target; accept @username or numeric id
-        try:
-            tgt = resolve_target(target_str) if 'resolve_target' in globals() else target_str
-        except Exception:
-            tgt = target_str
-        chat = bot.get_chat(tgt)
-        me = bot.get_me()
-        try:
-            admins = bot.get_chat_administrators(chat.id)
-            is_admin = any(getattr(a, "user", None) and a.user.id == me.id for a in admins)
-        except Exception:
-            admins = []
-            is_admin = False
-
-        title = getattr(chat, "title", None) or (("@" + chat.username) if getattr(chat, "username", None) else str(chat.id))
-        lines = [
-            "📡 דיאגנוסטיקת יעד",
-            f"• Chat ID: <code>{chat.id}</code>",
-            f"• Title/Username: <b>{title}</b>",
-            f"• Bot Admin: {'✅ כן' if is_admin else '❌ לא'}"
-        ]
-        tip = ""
-        if not is_admin:
-            tip = "\nℹ️ כדי לפרסם לערוץ, הבוט חייב להיות מנהל. אחרת תופיע שגיאת 400 (chat not found)."
-        return True, "\n".join(lines) + tip
+        ks = ae_autofetcher.read_keywords(KEYWORDS_FILE)
+        if not ks:
+            bot.reply_to(msg, "אין מילות מפתח עדיין. הוסף עם /auto_add <keyword>")
+            return
+        bot.reply_to(msg, "📃 מילות מפתח:\n• " + "\n• ".join(ks))
     except Exception as e:
-        return False, f"❌ לא ניתן לאמת יעד: {e}"
+        bot.reply_to(msg, f"❌ שגיאה: {e}")
+
 
 
 if __name__ == "__main__":
@@ -1486,9 +1460,6 @@ if __name__ == "__main__":
 
     while True:
         try:
-            _log_target_admin_status(CURRENT_TARGET)
-
-
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
         except Exception as e:
             msg = str(e)
