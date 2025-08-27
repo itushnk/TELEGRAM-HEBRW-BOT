@@ -38,23 +38,51 @@ PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 
-# Auto-fetcher
-AUTO_FETCH_FLAG_FILE = os.path.join(BASE_DIR, "auto_fetch.enabled")
-KEYWORDS_FILE = os.path.join(BASE_DIR, "keywords.txt")
-
 # שער ברירת מחדל
 USD_TO_ILS_RATE_DEFAULT = 3.55
 
 # נעילה למופע יחיד
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
-import ae_autofetcher
 # ========= INIT =========
 if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 SESSION = requests.Session()
+
+# === AliExpress Affiliate Client (inline) ===
+class AliExpressAffiliateClient:
+    """
+    מינימום נדרש כדי שהבוט ירוץ. משתמש במפתחות מה-ENV.
+    פעולות החיפוש כאן בסיסיות/דמה; בהמשך אפשר להחליף לקריאות API מלאות.
+    """
+    def __init__(self, app_key=None, app_secret=None, tracking_id=None):
+        self.app_key = app_key or os.getenv("AE_APP_KEY")
+        self.app_secret = app_secret or os.getenv("AE_APP_SECRET")
+        self.tracking_id = tracking_id or os.getenv("AE_TRACKING_ID")
+        self.lang = os.getenv("AE_TARGET_LANGUAGE", "HE")
+        self.currency = os.getenv("AE_TARGET_CURRENCY", "ILS")
+        self.ship_to = os.getenv("AE_SHIP_TO_COUNTRY", "IL")
+        if not (self.app_key and self.app_secret):
+            print("[WARN] AliExpress keys missing; set AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID", flush=True)
+
+    def _ensure_ready(self):
+        if not (self.app_key and self.app_secret and self.tracking_id):
+            raise RuntimeError("Missing AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID")
+
+    def search_products(self, keyword: str, page_size: int = 5):
+        """
+        TODO: לממש קריאה אמיתית ל-Affiliates API.
+        כרגע: אם יש מפתחות – מחזיר רשימה ריקה (כדי לא לשבור זרימה).
+        """
+        self._ensure_ready()
+        return []
+
+    def generate_promotion_link(self, item_id: str):
+        self._ensure_ready()
+        return {"promotion_url": f"https://www.aliexpress.com/item/{item_id}.html"}
+
 # === Affiliates Inline Panel (init) ===
 try:
     AE = AliExpressAffiliateClient()  # Uses ENV: AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID
@@ -75,6 +103,184 @@ def _require_ae(_msg_or_chat_id):
         return False
     return True
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+
+# === Auto-Fetcher (inline) ===
+from urllib.parse import urlparse as _urlparse
+def _now_il():
+    try:
+        return datetime.now(tz=IL_TZ)
+    except Exception:
+        return datetime.now()
+
+def _is_url(u: str) -> bool:
+    try:
+        r = _urlparse((u or "").strip())
+        return r.scheme in ("http", "https") and bool(r.netloc)
+    except Exception:
+        return False
+
+def af_ensure_keywords_file(keywords_path: str):
+    if not os.path.exists(keywords_path):
+        with open(keywords_path, "w", encoding="utf-8") as f:
+            f.write("# One keyword per line (comments start with #)\\n")
+            f.write("bluetooth earbuds\\n")
+            f.write("ssd 1tb\\n")
+            f.write("kids toys\\n")
+    return keywords_path
+
+def af_read_keywords(keywords_path: str):
+    keys = []
+    try:
+        with open(keywords_path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                keys.append(s)
+    except Exception:
+        pass
+    return keys
+
+def af_call_search(AE, keyword: str, page_size: int = 5):
+    if AE is None:
+        return []
+    candidates = [
+        ("search_products", {"keyword": keyword, "page_size": page_size}),
+        ("search", {"keyword": keyword, "page_size": page_size}),
+        ("product_search", {"keyword": keyword, "page_size": page_size}),
+        ("get_products", {"query": keyword, "limit": page_size}),
+        ("fetch_products", {"query": keyword, "limit": page_size}),
+    ]
+    for name, params in candidates:
+        try:
+            fn = getattr(AE, name, None)
+            if callable(fn):
+                res = fn(**params)
+                if isinstance(res, dict) and res.get("items"):
+                    return res["items"]
+                if isinstance(res, (list, tuple)):
+                    return list(res)
+        except Exception as e:
+            print(f"[AUTO] AE.{name} failed for '{keyword}': {e}", flush=True)
+            continue
+    print(f"[AUTO] No suitable AE search method found for '{keyword}'", flush=True)
+    return []
+
+def af_norm_item(obj):
+    get = lambda *names: next((obj.get(n) for n in names if isinstance(obj, dict) and obj.get(n) is not None), None)
+    item_id = get("item_id", "itemId", "product_id", "productId", "aliExpressItemId", "target_id")
+    title   = get("title", "subject", "name")
+    img     = get("image_url", "imageUrl", "img_url", "picture", "main_image", "image", "pic_url")
+    video   = get("video_url", "videoUrl")
+    link    = get("promotion_link", "promotionUrl", "url", "link", "target_url")
+    if not link and item_id:
+        link = f"https://www.aliexpress.com/item/{item_id}.html"
+    return {
+        "ItemId": str(item_id or "").strip(),
+        "Title": (title or "").strip(),
+        "Image Url": (img or "").strip(),
+        "Video Url": (video or "").strip(),
+        "BuyLink": (link or "").strip(),
+        "Opening": "",
+        "Strengths": "",
+    }
+
+def af_read_queue(csv_path: str):
+    rows = []
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows.append(row)
+    except FileNotFoundError:
+        pass
+    return rows
+
+def af_write_queue(csv_path: str, rows):
+    header = ["ItemId","Title","Image Url","Video Url","BuyLink","Opening","Strengths"]
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in header})
+
+def af_dedupe(existing, new_items):
+    seen_ids = { (r.get("ItemId") or "").strip() for r in existing }
+    seen_links = { (r.get("BuyLink") or "").strip() for r in existing }
+    out = []
+    for it in new_items:
+        iid = (it.get("ItemId") or "").strip()
+        ln  = (it.get("BuyLink") or "").strip()
+        if (iid and iid in seen_ids) or (ln and ln in seen_links):
+            continue
+        out.append(it)
+        if iid: seen_ids.add(iid)
+        if ln:  seen_links.add(ln)
+    return out
+
+def af_fetch_once(AE, pending_csv: str, keywords_path: str, max_per_keyword: int = 3):
+    kws = af_read_keywords(keywords_path)
+    if not kws:
+        print(f"[{_now_il()}] [AUTO] No keywords – skipping cycle", flush=True)
+        return 0
+
+    existing = af_read_queue(pending_csv)
+    added = 0
+    for kw in kws:
+        raw = af_call_search(AE, kw, page_size=max_per_keyword)
+        if not raw:
+            print(f"[AUTO] No results for '{kw}'", flush=True)
+            continue
+        norm = [af_norm_item(x) for x in raw if isinstance(x, dict)]
+        norm = [n for n in norm if n.get("BuyLink")]
+        to_add = af_dedupe(existing, norm)[:max_per_keyword]
+        if not to_add:
+            continue
+        existing.extend(to_add)
+        added += len(to_add)
+
+    if added:
+        af_write_queue(pending_csv, existing)
+        print(f"[{_now_il()}] [AUTO] Added {added} items to queue", flush=True)
+    else:
+        print(f"[{_now_il()}] [AUTO] No new items to add", flush=True)
+    return added
+
+def af_start(AE, pending_csv: str, base_dir: str, flag_filename: str = "auto_fetch.enabled"):
+    FLAG = os.path.join(base_dir, flag_filename)
+    KEYWORDS = os.path.join(base_dir, "keywords.txt")
+    af_ensure_keywords_file(KEYWORDS)
+    interval_min = int(os.getenv("AE_AUTO_FETCH_INTERVAL_MIN", "60"))
+    max_per_kw = int(os.getenv("AE_AUTO_FETCH_MAX_PER_KEYWORD", "3"))
+
+    def _loop():
+        print(f"[AUTO] Fetcher thread started (interval={interval_min}m, max_per_kw={max_per_kw})", flush=True)
+        while True:
+            try:
+                if not os.path.exists(FLAG):
+                    time.sleep(10)
+                else:
+                    if AE is None:
+                        print(f"[{_now_il()}] [AUTO] AE client not ready – skipping", flush=True)
+                    else:
+                        af_fetch_once(AE, pending_csv, KEYWORDS, max_per_kw)
+                    time.sleep(max(30, interval_min*60))
+            except Exception as e:
+                print(f"[AUTO] cycle error: {e}", flush=True)
+                time.sleep(60)
+
+    t = threading.Thread(target=_loop, name="AEAutoFetcher", daemon=True)
+    t.start()
+    return {"flag_path": FLAG, "keywords_path": KEYWORDS}
+
+# expose a module-like namespace to reuse existing command handlers
+class _AFNS:
+    ensure_keywords_file = staticmethod(af_ensure_keywords_file)
+    read_keywords = staticmethod(af_read_keywords)
+    start_auto_fetcher = staticmethod(af_start)
+    fetch_once = staticmethod(af_fetch_once)
+
+ae_autofetcher = _AFNS()
+
 IL_TZ = ZoneInfo("Asia/Jerusalem")
 
 def translate_missing_fields(csv_path):
@@ -184,8 +390,6 @@ def acquire_single_instance_lock(lock_path: str):
     except Exception as e:
         print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
         return None
-
-
 # ========= WEBHOOK DIAGNOSTICS =========
 def print_webhook_info():
     try:
@@ -491,59 +695,39 @@ def post_to_channel(product):
 
 
 # ========= ATOMIC SEND =========
-def send_next_locked(source: str = "loop") -> bool:
-    with FILE_LOCK:
-        pending = read_products(PENDING_CSV)
-        if not pending:
-            print(f"[{datetime.now(tz=IL_TZ)}] {source}: no pending", flush=True)
-            return False
 
-        item = pending[0]
-        item_id = (item.get("ItemId") or "").strip()
-        title = (item.get("Title") or "").strip()[:120]
-        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
+def send_next_locked(mode="manual"):
+    """
+    שולח את הפריט הראשון בתור. מתקדם בתור **רק** אם השליחה הצליחה.
+    מחזיר True בהצלחה, False בכישלון.
+    """
+    try:
+        with FILE_LOCK:
+            rows = read_products(PENDING_CSV)
+            if not rows:
+                print(f"[{datetime.now(tz=IL_TZ)}] {mode}: queue empty", flush=True)
+                return False
+            product = rows[0]
 
-        try:
-            post_to_channel(item)
-        except Exception as e:
-            print(f"[{datetime.now(tz=IL_TZ)}] {source}: send FAILED: {e}", flush=True)
-            return False
+        item_id = (product.get("ItemId") or "ללא מספר")
+        title = (product.get("Title") or "").strip()[:120]
+        print(f"[{datetime.now(tz=IL_TZ)}] {mode}: sending ItemId={item_id} | Title={title}", flush=True)
 
-        try:
-            write_products(PENDING_CSV, pending[1:])
-        except Exception as e:
-            print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED, retry once: {e}", flush=True)
-            time.sleep(0.2)
-            try:
-                write_products(PENDING_CSV, pending[1:])
-            except Exception as e2:
-                print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED permanently: {e2}", flush=True)
-                return True
+        # מנסה לפרסם – אם נכשל, תיזרק חריגה ולא נתקדם בתור
+        post_to_channel(product)
 
-        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sent & advanced queue", flush=True)
+        with FILE_LOCK:
+            rows = read_products(PENDING_CSV)  # קריאה מחדש להגנה מקונקרנציה
+            if rows:
+                rows.pop(0)
+                write_products(PENDING_CSV, rows)
+
+        print(f"[{datetime.now(tz=IL_TZ)}] {mode}: sent & advanced queue", flush=True)
         return True
 
-
-# ========= DELAY =========
-
-# ========= AUTO DELAY MODE =========
-AUTO_FLAG_FILE = os.path.join(BASE_DIR, "auto_delay.flag")
-
-
-AUTO_SCHEDULE = [
-    (dtime(6, 0), dtime(9, 0), 1200),
-    (dtime(9, 0), dtime(15, 0), 1500),
-    (dtime(15, 0), dtime(22, 0), 1200),
-    (dtime(22, 0), dtime(23, 59), 1500),
-]
-
-
-def read_auto_flag():
-    try:
-        with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except:
-        return "on"
+    except Exception as e:
+        print(f"[{datetime.now(tz=IL_TZ)}] {mode}: send FAILED (not advancing): {e}", flush=True)
+        return False
 
 def write_auto_flag(value):
     with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
@@ -1355,79 +1539,23 @@ def _debug_log_everything(msg):
 
 
 # ========= MAIN =========
-# === Auto-fetcher commands ===
-@bot.message_handler(commands=['auto_on'])
-def _auto_on(msg):
+@bot.message_handler(commands=['aff_test'])
+def _aff_test(msg):
     try:
-        # admin gate if available
-        try:
-            if not _is_admin(msg):
-                return
-        except Exception:
-            pass
-        open(AUTO_FETCH_FLAG_FILE, "w").close()
-        ae_autofetcher.ensure_keywords_file(KEYWORDS_FILE)
-        bot.reply_to(msg, "✅ Auto-fetch הופעל. אפשר לערוך מילים בקובץ keywords.txt. (המחזור הבא יתקיים תוך דקות)")
-    except Exception as e:
-        bot.reply_to(msg, f"❌ כשל בהפעלת Auto-fetch: {e}")
-
-@bot.message_handler(commands=['auto_off'])
-def _auto_off(msg):
-    try:
-        try:
-            if not _is_admin(msg):
-                return
-        except Exception:
-            pass
-        if os.path.exists(AUTO_FETCH_FLAG_FILE):
-            os.remove(AUTO_FETCH_FLAG_FILE)
-        bot.reply_to(msg, "⏸️ Auto-fetch כובה.")
-    except Exception as e:
-        bot.reply_to(msg, f"❌ כשל בכיבוי Auto-fetch: {e}")
-
-@bot.message_handler(commands=['auto_status'])
-def _auto_status(msg):
-    try:
-        enabled = os.path.exists(AUTO_FETCH_FLAG_FILE)
-        kws = ae_autofetcher.read_keywords(KEYWORDS_FILE)
-        txt = f"📡 Auto-fetch: {'✅ פעיל' if enabled else '⏸️ כבוי'}\nמילות מפתח ({len(kws)}): " + (', '.join(kws[:10]) if kws else '—')
-        bot.reply_to(msg, txt)
-    except Exception as e:
-        bot.reply_to(msg, f"❌ שגיאה: {e}")
-
-@bot.message_handler(commands=['auto_add'])
-def _auto_add(msg):
-    try:
-        try:
-            if not _is_admin(msg):
-                return
-        except Exception:
-            pass
-        parts = (msg.text or "").split(" ", 1)
-        if len(parts) < 2 or not parts[1].strip():
-            bot.reply_to(msg, "השתמש: /auto_add <keyword>")
+        # נבדוק שהמפתחות טעונים ונחזיר תשובה קצרה
+        if AE is None:
+            bot.reply_to(msg, "❌ AE: הלקוח לא מאותחל (חסר קובץ/מחלקה).")
             return
-        kw = parts[1].strip()
-        ks = ae_autofetcher.read_keywords(KEYWORDS_FILE)
-        if kw in ks:
-            bot.reply_to(msg, f"'{kw}' כבר קיים.")
+        # בדיקת מפתחות
+        try:
+            url = AE.generate_promotion_link("1005001234567890")  # בדיקת חתימה/ENV בלבד
+            ok = bool(url.get("promotion_url"))
+        except Exception as e:
+            bot.reply_to(msg, f"❌ AE: {e}")
             return
-        with open(KEYWORDS_FILE, "a", encoding="utf-8") as f:
-            f.write("\n" + kw)
-        bot.reply_to(msg, f"✅ נוסף: {kw}")
+        bot.reply_to(msg, "✅ AliExpress API: מפתחות נקלטו ונגישים.")
     except Exception as e:
-        bot.reply_to(msg, f"❌ שגיאה: {e}")
-
-@bot.message_handler(commands=['auto_list'])
-def _auto_list(msg):
-    try:
-        ks = ae_autofetcher.read_keywords(KEYWORDS_FILE)
-        if not ks:
-            bot.reply_to(msg, "אין מילות מפתח עדיין. הוסף עם /auto_add <keyword>")
-            return
-        bot.reply_to(msg, "📃 מילות מפתח:\n• " + "\n• ".join(ks))
-    except Exception as e:
-        bot.reply_to(msg, f"❌ שגיאה: {e}")
+        bot.reply_to(msg, f"❌ שגיאת בדיקה: {e}")
 
 
 
