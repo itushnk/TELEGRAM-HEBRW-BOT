@@ -590,6 +590,24 @@ def cmd_ae_diag(m: types.Message):
 def cmd_version(m: types.Message):
     bot.reply_to(m, nfc("גרסה: v2025-08-28T21:01:17"))
 
+
+@bot.message_handler(commands=["queue_status"])
+def cmd_queue_status(m: types.Message):
+    try:
+        rows = read_queue()
+        n = len(rows)
+        preview = []
+        for i, r in enumerate(rows[:3], start=1):
+            pid = r.get("ProductId","")
+            title = r.get("Title") or r.get("Product Desc") or ""
+            preview.append(f"{i}. {title[:40]} (#{pid})")
+        if not preview:
+            bot.reply_to(m, nfc("התור ריק."))
+            return
+        bot.reply_to(m, nfc("כמות בתור: " + str(n) + "\n" + "\n".join(preview)))
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאת בדיקת תור: {e}"))
+
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -720,6 +738,10 @@ def on_document_upload(m: types.Message):
         with open(save_path, "wb") as f:
             f.write(data)
         added, msg = import_products_from_csv(save_path)
+        try:
+            DELAY_EVENT.set()
+        except Exception:
+            pass
         bot.reply_to(m, nfc(f"נטען הקובץ {filename}. נוספו {added} פריטים לתור.\n{msg}"))
     except Exception as e:
         bot.reply_to(m, nfc(f"שגיאה בקליטת הקובץ: {e}"))
@@ -771,6 +793,10 @@ def import_products_from_csv(path: str) -> (int, str):
         if not rows:
             return 0, (warn or "לא נמצאו שורות תקינות.")
         added = append_to_queue(rows)
+        try:
+            print(f"[{now_str()}] Import: {len(rows)} read, {added} appended to queue.csv", flush=True)
+        except Exception:
+            pass
         return added, (warn or "OK")
     except Exception as e:
         return 0, f"שגיאה בקריאת CSV: {e}"
@@ -872,6 +898,34 @@ def on_receive_id_or_url(m: types.Message):
         bot.reply_to(m, nfc(f"פרטי מוצר {pid} נוספו לתור ({added})."))
     except Exception as e:
         bot.reply_to(m, nfc(f"שגיאת פירוט מוצר: {e}"))
+
+
+def publish_next() -> bool:
+    """
+    Pulls first row from queue and posts it to the channel. Returns True if posted.
+    Reuses the same logic used by the poster loop.
+    """
+    rows = read_queue()
+    if not rows:
+        return False
+    row = rows[0]
+    # try to post
+    try:
+        text = build_post(row)
+        image = (row.get("Image Url") or "").strip()
+        link  = (row.get("Promotion Url") or "").strip()
+        # If there's an image URL, try photo; else send text
+        if image:
+            bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        print(f"[{now_str()}] Failed to post: {e}", flush=True)
+        return False
+    # remove the posted row from queue
+    rest = rows[1:]
+    write_csv_rows(QUEUE_CSV, rest, fieldnames=list(rows[0].keys()))
+    return True
 
 # ========= משיכת מוצרים לתור =========
 @bot.message_handler(func=lambda msg: msg.text == "➕ משוך מוצרים")
