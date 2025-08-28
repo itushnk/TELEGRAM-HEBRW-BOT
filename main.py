@@ -789,14 +789,11 @@ def do_fetch_keyword(m: types.Message):
         if not items:
             hint = ""
             if res.get("error"):
-                hint = f"
-(רמז מהשרת: {res.get('error')})"
+                hint = f"\n(רמז מהשרת: {res.get('error')})"
             dbg = res.get("_debug") or {}
             if dbg:
-                hint += f"
-[debug sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}{hint}
-טיפים: נסו מילת חיפוש באנגלית, או ודאו שה-Tracking ID תקין."))
+                hint += f"\n[debug sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
+            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}{hint}\nטיפים: נסו מילת חיפוש באנגלית, או ודאו שה-Tracking ID תקין."))
             return
         rows = []
         for it in items:
