@@ -716,7 +716,7 @@ def build_main_menu_kb():
     kb.add(types.KeyboardButton("⚙️ הגדרות ערוץ"))
     return kb
 
-@bot.message_handler(commands=["menu","start","help"])
+@bot.message_handler(commands=["menu"])
 def cmd_menu(m: types.Message):
     kb = build_main_menu_kb()
     bot.reply_to(m, nfc("תפריט ראשי"), reply_markup=kb)
@@ -1083,6 +1083,44 @@ def publish_next() -> bool:
     write_csv_rows(QUEUE_CSV, rest, fieldnames=list(rows[0].keys()))
     return True
 
+
+
+from telebot import types as _types  # alias for inline keyboards
+
+def open_inline_settings(chat_id: int):
+    ikb = _types.InlineKeyboardMarkup(row_width=1)
+    ikb.add(
+        _types.InlineKeyboardButton("🔓 קבע ערוץ ציבורי (@username)", callback_data="set_public_inline"),
+        _types.InlineKeyboardButton("🔒 קבע ערוץ פרטי (Forward מהערוץ)", callback_data="set_private_inline"),
+        _types.InlineKeyboardButton("ℹ️ מצב ערוץ נוכחי", callback_data="status_inline")
+    )
+    bot.send_message(chat_id, nfc("הגדרות ערוץ (Inline) — בחר פעולה:"), reply_markup=ikb)
+
+@bot.message_handler(commands=["settings"])
+def cmd_settings(m: types.Message):
+    if not is_admin(m.from_user.id):
+        bot.reply_to(m, nfc("אין הרשאה לפתוח הגדרות ערוץ.")); return
+    open_inline_settings(m.chat.id)
+
+@bot.callback_query_handler(func=lambda c: c.data in ("set_public_inline","set_private_inline","status_inline"))
+def on_settings_inline(c: types.CallbackQuery):
+    try:
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "אין הרשאה", show_alert=True); return
+        if c.data == "status_inline":
+            cid = get_current_channel_id() or "(לא הוגדר)"
+            ctype = GLOBAL_CONFIG.get("channel_type") or ("public" if str(cid).startswith("@") else "private" if str(cid).startswith("-100") else "(לא ידוע)")
+            owner = GLOBAL_CONFIG.get("admin_user_id")
+            bot.answer_callback_query(c.id, "נשלח מצב לערוץ")
+            bot.send_message(c.message.chat.id, nfc(f"ערוץ נוכחי: {cid}\nסוג: {ctype}\nמנהל: {owner if owner else '(לא הוגדר)'}"))
+        elif c.data == "set_public_inline":
+            msg = bot.send_message(c.message.chat.id, nfc("שלח/י עכשיו @שם_הערוץ הציבורי (למשל @best_deals)."))
+            bot.register_next_step_handler(msg, on_set_public_value)
+        elif c.data == "set_private_inline":
+            msg = bot.send_message(c.message.chat.id, nfc("העבר/י כעת הודעה מהערוץ (Forward) כדי לזהות את ה-Chat ID."))
+            bot.register_next_step_handler(msg, on_set_private_value)
+    except Exception as e:
+        bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=True)
 
 # ========= Channel Settings =========
 @bot.message_handler(func=lambda msg: msg.text == "⚙️ הגדרות ערוץ")
