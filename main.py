@@ -637,15 +637,71 @@ def poster_loop():
         DELAY_EVENT.clear()
 
 # ========= main =========
+
+# ========= Webhook / Polling selection =========
+USE_WEBHOOK = (os.environ.get("USE_WEBHOOK", "false").lower() in ("1","true","yes","on"))
+WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").rstrip("/")  # e.g., https://your-app.up.railway.app
+WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"  # unique path; secret header adds security
+
+if USE_WEBHOOK:
+    from flask import Flask, request, abort
+    app = Flask(__name__)
+
+    @app.route("/", methods=["GET"])
+    def root_ok():
+        return "OK", 200
+
+    @app.route(WEBHOOK_PATH, methods=["POST"])
+    def telegram_webhook():
+        # Optional: verify Telegram secret header
+        if WEBHOOK_SECRET:
+            secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if secret_hdr != WEBHOOK_SECRET:
+                return abort(403)
+        try:
+            data = request.get_data().decode("utf-8")
+            update = telebot.types.Update.de_json(data)
+        except Exception:
+            return abort(400)
+        bot.process_new_updates([update])
+        return "OK", 200
+
 def main():
-    # הפעלת לולאת השידור בחוט רקע
+    # poster thread always runs (works with both polling and webhook)
     t = threading.Thread(target=poster_loop, daemon=True)
     t.start()
-    # הפעלת polling
+
+    if USE_WEBHOOK and WEBHOOK_BASE_URL:
+        # Switch to webhook mode to avoid 409 conflicts.
+        try:
+            # Remove old webhook just in case, then set new one
+            try:
+                bot.delete_webhook(drop_pending_updates=True)
+            except Exception:
+                pass
+            full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
+            bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
+            port = int(os.environ.get("PORT", "8080"))
+            print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
+            from waitress import serve as _serve
+            _serve(app, host="0.0.0.0", port=port)
+            return
+        except Exception as e:
+            print(f"[{now_str()}] Webhook setup failed: {e}. Falling back to polling.", flush=True)
+
+    # Fallback / default: polling
     try:
+        # Ensure webhook is removed when polling (prevents conflicts)
+        try:
+            bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
         bot.infinity_polling(timeout=60, long_polling_timeout=30)
     except telebot.apihelper.ApiTelegramException as e:
         print(f"[{now_str()}] Polling error: {e}", flush=True)
+        # If 409 conflict occurs repeatedly, advise switching to webhook mode
+        print(f"[{now_str()}] TIP: Set USE_WEBHOOK=true and WEBHOOK_BASE_URL to avoid 409 conflicts.", flush=True)
     except Exception as e:
         print(f"[{now_str()}] Polling crashed: {e}", flush=True)
 
