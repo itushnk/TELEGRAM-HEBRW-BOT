@@ -506,8 +506,7 @@ def build_post(row: Dict[str, Any]) -> str:
     parts.append(f"מספר פריט: {nfc(item_id)}")
     if join_line:
         parts.append(join_line)
-    return nfc("
-".join(parts))
+    return nfc("\n".join(parts))
 
 def try_post_row(row: Dict[str, Any]) -> bool:
     msg = build_post(row)
