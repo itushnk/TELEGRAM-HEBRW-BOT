@@ -35,7 +35,9 @@ PROCESSED_CSV = os.path.join(BASE_DIR, "processed.csv")   # מה שפורסם
 STATE_JSON    = os.path.join(BASE_DIR, "state.json")      # index/delay/auto
 LOCK_FILE     = os.path.join(BASE_DIR, "bot.lock")        # קובץ נעילה
 AUTO_FLAG_FILE= os.path.join(BASE_DIR, "auto_mode.flag")  # on/off
-KEYWORDS_TXT  = os.path.join(BASE_DIR, "keywords.txt")    # מילות חיפוש לאוטו-פצ'ר (אופציונלי)
+KEYWORDS_TXT  = os.path.join(BASE_DIR, "keywords.txt")
+AE_LAST_REQ_JSON = os.path.join(BASE_DIR, "ae_last_request.json")
+AE_LAST_RES_JSON = os.path.join(BASE_DIR, "ae_last_response.json")    # מילות חיפוש לאוטו-פצ'ר (אופציונלי)
 
 TZ = ZoneInfo("Asia/Jerusalem")
 
@@ -227,9 +229,11 @@ if SESSION is not None:
 
 class AliExpressAffiliateClient:
     """
-    לקוח אפיליאייטים מלא עם ניסיונות חתימה/טיימסטמפ וגיבוי שפה/מטבע.
+    לקוח אפיליאייטים עם נסיונות endpoint/חתימה/טיימסטמפ וגם פרמטרים חלופיים (trackingId/tracking_id, pageNo/page_no וכו').
+    כותב את הקריאה/תשובה האחרונות לקבצים: ae_last_request.json / ae_last_response.json
     """
-    _ENDPOINT = API_ENDPOINTS[0]
+    _METHODS = ["aliexpress.affiliate.product.query", "aliexpress.affiliate.product.search"]
+    _ENDPOINTS = API_ENDPOINTS
 
     def __init__(self, app_key: Optional[str] = None, app_secret: Optional[str] = None, tracking_id: Optional[str] = None):
         self.app_key = (app_key or AE_APP_KEY)
@@ -251,64 +255,84 @@ class AliExpressAffiliateClient:
         return hmac.new(self.app_secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest().upper()
 
     def _sign_md5(self, params: Dict[str, Any]) -> str:
-        # AliExpress MD5: app_secret + concat(k=v) + app_secret
-        base = "".join(f"{k}{params[k]}" for k in sorted(params))  # concat without '=' and '&' (per AOP MD5 spec)
-        s = (self.app_secret + base + self.app_secret).encode("utf-8")
+        base = "".join(f"{k}{params[k]}" for k in sorted(params))
         import hashlib
-        return hashlib.md5(s).hexdigest().upper()
+        return hashlib.md5((self.app_secret + base + self.app_secret).encode("utf-8")).hexdigest().upper()
 
-    def _call_once(self, method: str, biz_params: Dict[str, Any], sign_method: str, ts_mode: str) -> Dict[str, Any]:
+    def _http(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
         if SESSION is None:
             raise RuntimeError("requests not available in this environment.")
-        last_exc = None
-        for ep in API_ENDPOINTS:
-            try:
-                frame = {
-                    "app_key": self.app_key,
-                    "method": method,
-                    "format": "json",
-                    "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
-                    "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
-                    "v": "1.0",
-                }
-                merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
-                sign_params = {k: merged[k] for k in merged if k != "sign"}
-                if sign_method.lower() == "hmac":
-                    merged["sign"] = self._sign_hmac_sha256(sign_params)
-                else:
-                    merged["sign"] = self._sign_md5(sign_params)
-                r = SESSION.get(ep, params=merged, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                if isinstance(data, dict):
-                    data.setdefault("_debug", {})["endpoint"] = ep
-                    data["_debug"]["sign_method_used"] = frame["sign_method"]
-                    data["_debug"]["timestamp_mode"] = ts_mode
-                return data
-            except Exception as e:
-                last_exc = e
-                continue
-        if last_exc:
-            raise last_exc
-        return {}
+        # write request snapshot
+        try:
+            with open(AE_LAST_REQ_JSON, "w", encoding="utf-8") as f:
+                json.dump({"endpoint": endpoint, "params": params}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        r = SESSION.get(endpoint, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        # write response snapshot
+        try:
+            with open(AE_LAST_RES_JSON, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return data
 
+    def _call_once(self, endpoint: str, method: str, biz_params: Dict[str, Any], sign_method: str, ts_mode: str) -> Dict[str, Any]:
+        frame = {
+            "app_key": self.app_key,
+            "method": method,
+            "format": "json",
+            "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
+            "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
+            "v": "1.0",
+        }
+        merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
+        sign_params = {k: merged[k] for k in merged if k != "sign"}
+        merged["sign"] = (self._sign_hmac_sha256(sign_params) if sign_method.lower()=="hmac" else self._sign_md5(sign_params))
+        data = self._http(endpoint, merged)
+        if isinstance(data, dict):
+            data.setdefault("_debug", {})["endpoint"] = endpoint
+            data["_debug"]["sign_method_used"] = frame["sign_method"]
+            data["_debug"]["timestamp_mode"] = ts_mode
+            data["_debug"]["method"] = method
+        return data
 
-    def _call(self, method: str, biz_params: Dict[str, Any]) -> Dict[str, Any]:
-        # Try multiple combos to survive doc variations between endpoints/apps
-        tries = [("hmac","ms"), ("hmac","s"), ("md5","s")]
+    def _call_permutations(self, base_params: Dict[str, Any]) -> Dict[str, Any]:
+        tries_sm_ts = [("hmac","ms"), ("hmac","s"), ("md5","s")]
+        # param permutations
+        param_variants = []
+        for track_key in ("trackingId","tracking_id"):
+            for page_no in ("pageNo","page_no"):
+                for page_sz in ("pageSize","page_size"):
+                    for ship_key in ("ship_to","shipTo","ship_to_country"):
+                        p = dict(base_params)
+                        p[track_key] = base_params.get("trackingId") or base_params.get("tracking_id")
+                        p[page_no] = base_params.get("pageNo") or base_params.get("page_no") or 1
+                        p[page_sz] = base_params.get("pageSize") or base_params.get("page_size") or 10
+                        p[ship_key] = base_params.get("ship_to") or base_params.get("ship_to_country") or self.ship_to
+                        # remove canonical keys to avoid duplicates inside the same dict
+                        for k in ("trackingId","tracking_id","pageNo","page_no","pageSize","page_size","ship_to","ship_to_country","shipTo"):
+                            if k not in (track_key, page_no, page_sz, ship_key) and k in p:
+                                del p[k]
+                        param_variants.append(p)
+
         last_data = None
-        for sign_m, ts_m in tries:
-            try:
-                data = self._call_once(method, biz_params, sign_m, ts_m)
-                # If platform returned explicit signature error, continue
-                dstr = json.dumps(data, ensure_ascii=False)[:500].lower()
-                if any(x in dstr for x in ["signature", "sign", "invalid", "does not conform", "auth", "permission denied"]):
-                    last_data = data
-                    continue
-                return data
-            except Exception as e:
-                last_data = {"error": str(e), "_debug": {"sign_try": sign_m, "ts_mode": ts_m}}
-        # Return last data (with debug) so caller can surface the issue
+        for ep in self._ENDPOINTS:
+            for method in self._METHODS:
+                for pv in param_variants:
+                    for sign_m, ts_m in tries_sm_ts:
+                        try:
+                            data = self._call_once(ep, method, pv, sign_m, ts_m)
+                            dstr = json.dumps(data, ensure_ascii=False)[:600].lower()
+                            if any(x in dstr for x in ["signature", "sign", "invalid", "does not conform", "auth", "permission denied"]):
+                                last_data = data
+                                continue
+                            return data
+                        except Exception as e:
+                            last_data = {"error": str(e), "_debug": {"endpoint": ep, "method": method, "variant": pv}}
+                            continue
         return last_data or {}
 
     def _extract_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -333,40 +357,25 @@ class AliExpressAffiliateClient:
 
     def search_products(self, keyword: str, page_size: int = 5) -> Dict[str, Any]:
         self._ensure_ready()
-        # 1st try: user language/currency
-        data = self._call(
-            "aliexpress.affiliate.product.query",
-            {
-                "trackingId": self.tracking_id,
-                "keywords": keyword,
-                "pageNo": 1,
-                "pageSize": page_size,
-                "target_language": self.lang,
-                "target_currency": self.currency,
-                "ship_to": self.ship_to,
-            },
-        )
+        base_params = {
+            "trackingId": self.tracking_id,
+            "keywords": keyword,
+            "pageNo": 1,
+            "pageSize": page_size,
+            "target_language": self.lang,
+            "target_currency": self.currency,
+            "ship_to": self.ship_to,
+        }
+        data = self._call_permutations(base_params)
+
+        # fallback to EN/USD
         items = self._extract_items(data)
-
-        # Fallback: EN/USD if nothing found or error-like response
         if not items:
-            data_fallback = self._call(
-                "aliexpress.affiliate.product.query",
-                {
-                    "trackingId": self.tracking_id,
-                    "keywords": keyword,
-                    "pageNo": 1,
-                    "pageSize": page_size,
-                    "target_language": "EN",
-                    "target_currency": "USD",
-                    "ship_to": self.ship_to,
-                },
-            )
-            items = self._extract_items(data_fallback)
+            data_fb = self._call_permutations({**base_params, "target_language": "EN", "target_currency": "USD"})
+            items = self._extract_items(data_fb)
             if items:
-                data = data_fallback  # use the successful response
+                data = data_fb
 
-        # Normalize
         out = []
         for it in items:
             if not isinstance(it, dict):
@@ -377,24 +386,16 @@ class AliExpressAffiliateClient:
             promo = it.get("promotion_link") or it.get("promotionUrl") or it.get("target_url")
             if not promo and pid:
                 promo = f"https://www.aliexpress.com/item/{pid}.html"
-            out.append({
-                "productId": pid,
-                "title": title,
-                "imageUrl": image,
-                "promotionUrl": promo,
-            })
+            out.append({"productId": pid, "title": title, "imageUrl": image, "promotionUrl": promo})
 
-        # Surface possible platform error message to caller
+        # surface errors
         if not out and isinstance(data, dict):
-            # look for typical error fields
             for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
                 if k in data and data[k]:
                     return {"items": [], "error": str(data[k]), "_debug": data.get("_debug", {})}
-            # or a code
             for k in ("resp_code","code","status"):
                 if k in data and str(data[k]) not in ("0","200","OK","ok"):
                     return {"items": [], "error": f"code={data[k]}", "_debug": data.get("_debug", {})}
-
         return {"items": out, "_debug": data.get("_debug", {}) if isinstance(data, dict) else {}}
 
     def generate_promotion_link(self, item_id: str) -> Dict[str, Any]:
