@@ -218,8 +218,7 @@ except Exception:
 
 class AliExpressAffiliateClient:
     """
-    לקוח אפיליאייטים מלא: חתימה HMAC-SHA256 וקריאה ל-/sync (Business API).
-    דורש AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID בסביבה.
+    לקוח אפיליאייטים מלא עם ניסיונות חתימה/טיימסטמפ וגיבוי שפה/מטבע.
     """
     _ENDPOINT = "https://api-sg.aliexpress.com/sync"
 
@@ -237,30 +236,86 @@ class AliExpressAffiliateClient:
         if not (self.app_key and self.app_secret and self.tracking_id):
             raise RuntimeError("Missing AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID")
 
-    def _sign(self, params: Dict[str, Any]) -> str:
+    def _sign_hmac_sha256(self, params: Dict[str, Any]) -> str:
         base = "&".join(f"{k}={params[k]}" for k in sorted(params))
-        return hmac.new(self.app_secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()
+        import hmac, hashlib
+        return hmac.new(self.app_secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest().upper()
 
-    def _call(self, method: str, biz_params: Dict[str, Any]) -> Dict[str, Any]:
+    def _sign_md5(self, params: Dict[str, Any]) -> str:
+        # AliExpress MD5: app_secret + concat(k=v) + app_secret
+        base = "".join(f"{k}{params[k]}" for k in sorted(params))  # concat without '=' and '&' (per AOP MD5 spec)
+        s = (self.app_secret + base + self.app_secret).encode("utf-8")
+        import hashlib
+        return hashlib.md5(s).hexdigest().upper()
+
+    def _call_once(self, method: str, biz_params: Dict[str, Any], sign_method: str, ts_mode: str) -> Dict[str, Any]:
         if SESSION is None:
             raise RuntimeError("requests not available in this environment.")
         frame = {
             "app_key": self.app_key,
             "method": method,
             "format": "json",
-            "sign_method": "HmacSHA256",
-            "timestamp": int(time.time() * 1000),
+            "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
+            "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
             "v": "1.0",
         }
         merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
-        merged["sign"] = self._sign({k: merged[k] for k in merged if k != "sign"})
+        # Build sign params without 'sign'
+        sign_params = {k: merged[k] for k in merged if k != "sign"}
+        if sign_method.lower() == "hmac":
+            merged["sign"] = self._sign_hmac_sha256(sign_params)
+        else:
+            merged["sign"] = self._sign_md5(sign_params)
         r = SESSION.get(self._ENDPOINT, params=merged, timeout=30)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        # Attach debug info to help upstream callers
+        if isinstance(data, dict):
+            data.setdefault("_debug", {})["sign_method_used"] = frame["sign_method"]
+            data["_debug"]["timestamp_mode"] = ts_mode
+        return data
+
+    def _call(self, method: str, biz_params: Dict[str, Any]) -> Dict[str, Any]:
+        # Try multiple combos to survive doc variations between endpoints/apps
+        tries = [("hmac","ms"), ("hmac","s"), ("md5","s")]
+        last_data = None
+        for sign_m, ts_m in tries:
+            try:
+                data = self._call_once(method, biz_params, sign_m, ts_m)
+                # If platform returned explicit signature error, continue
+                dstr = json.dumps(data, ensure_ascii=False)[:500].lower()
+                if any(x in dstr for x in ["signature", "sign", "invalid", "does not conform", "auth", "permission denied"]):
+                    last_data = data
+                    continue
+                return data
+            except Exception as e:
+                last_data = {"error": str(e), "_debug": {"sign_try": sign_m, "ts_mode": ts_m}}
+        # Return last data (with debug) so caller can surface the issue
+        return last_data or {}
+
+    def _extract_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        def dig(d, path):
+            cur = d
+            for p in path:
+                if not isinstance(cur, dict):
+                    return None
+                cur = cur.get(p)
+            return cur
+        for path in [
+            ("resp_result", "result", "products"),
+            ("resp_result", "result", "items"),
+            ("result", "products"),
+            ("result", "items"),
+            ("items",),
+        ]:
+            v = dig(data, path)
+            if isinstance(v, list):
+                return v
+        return []
 
     def search_products(self, keyword: str, page_size: int = 5) -> Dict[str, Any]:
-        """חיפוש דרך aliexpress.affiliate.product.query ומיפוי לתבנית פשוטה."""
         self._ensure_ready()
+        # 1st try: user language/currency
         data = self._call(
             "aliexpress.affiliate.product.query",
             {
@@ -273,25 +328,27 @@ class AliExpressAffiliateClient:
                 "ship_to": self.ship_to,
             },
         )
-        def dig(d, path):
-            cur = d
-            for p in path:
-                if not isinstance(cur, dict):
-                    return None
-                cur = cur.get(p)
-            return cur
-        items = []
-        for path in [
-            ("resp_result", "result", "products"),
-            ("resp_result", "result", "items"),
-            ("result", "products"),
-            ("result", "items"),
-            ("items",),
-        ]:
-            v = dig(data, path)
-            if isinstance(v, list):
-                items = v
-                break
+        items = self._extract_items(data)
+
+        # Fallback: EN/USD if nothing found or error-like response
+        if not items:
+            data_fallback = self._call(
+                "aliexpress.affiliate.product.query",
+                {
+                    "trackingId": self.tracking_id,
+                    "keywords": keyword,
+                    "pageNo": 1,
+                    "pageSize": page_size,
+                    "target_language": "EN",
+                    "target_currency": "USD",
+                    "ship_to": self.ship_to,
+                },
+            )
+            items = self._extract_items(data_fallback)
+            if items:
+                data = data_fallback  # use the successful response
+
+        # Normalize
         out = []
         for it in items:
             if not isinstance(it, dict):
@@ -308,7 +365,19 @@ class AliExpressAffiliateClient:
                 "imageUrl": image,
                 "promotionUrl": promo,
             })
-        return {"items": out}
+
+        # Surface possible platform error message to caller
+        if not out and isinstance(data, dict):
+            # look for typical error fields
+            for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
+                if k in data and data[k]:
+                    return {"items": [], "error": str(data[k]), "_debug": data.get("_debug", {})}
+            # or a code
+            for k in ("resp_code","code","status"):
+                if k in data and str(data[k]) not in ("0","200","OK","ok"):
+                    return {"items": [], "error": f"code={data[k]}", "_debug": data.get("_debug", {})}
+
+        return {"items": out, "_debug": data.get("_debug", {}) if isinstance(data, dict) else {}}
 
     def generate_promotion_link(self, item_id: str) -> Dict[str, Any]:
         self._ensure_ready()
@@ -507,7 +576,16 @@ def do_fetch_keyword(m: types.Message):
         res = AE.search_products(kw, page_size=10)
         items = res.get("items", [])
         if not items:
-            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}"))
+            hint = ""
+            if res.get("error"):
+                hint = f"
+(רמז מהשרת: {res.get('error')})"
+            dbg = res.get("_debug") or {}
+            if dbg:
+                hint += f"
+[debug sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
+            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}{hint}
+טיפים: נסו מילת חיפוש באנגלית, או ודאו שה-Tracking ID תקין."))
             return
         rows = []
         for it in items:
@@ -524,8 +602,8 @@ def do_fetch_keyword(m: types.Message):
         bot.reply_to(m, nfc(f"נוספו {added} פריטים לתור מתוך החיפוש ל־“{kw}”"))
     except Exception as e:
         bot.reply_to(m, nfc(f"שגיאה במשיכה: {e}"))
-
-# ========= ניהול תור (עיון/מחיקה) =========
+# ========= ניהול תור
+ (עיון/מחיקה) =========
 BROWSE_INDEX: Dict[int, int] = {}  # chat_id -> index להצגה
 
 @bot.message_handler(func=lambda msg: msg.text == "🗂️ ניהול תור")
