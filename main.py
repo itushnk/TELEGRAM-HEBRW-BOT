@@ -15,6 +15,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 import datetime as dt
+import requests
 
 # ========= פלט מיידי ללוגים =========
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -230,6 +231,7 @@ try:
     import requests
     SESSION = requests.Session()
 except Exception:
+    SESSION = None
     pass  # נשתמש ב-requests כשיהיה זמין
 
 API_ENDPOINTS = ["https://api-sg.aliexpress.com/sync", "https://api-sg.aliexpress.com/rest", "https://api.aliexpress.com/sync"]
@@ -586,9 +588,6 @@ def cmd_ae_diag(m: types.Message):
 
 
 
-@bot.message_handler(commands=["version"])
-def cmd_version(m: types.Message):
-    bot.reply_to(m, nfc("גרסה: v2025-08-28T21:01:17"))
 
 
 @bot.message_handler(commands=["queue_status"])
@@ -607,6 +606,11 @@ def cmd_queue_status(m: types.Message):
         bot.reply_to(m, nfc("כמות בתור: " + str(n) + "\n" + "\n".join(preview)))
     except Exception as e:
         bot.reply_to(m, nfc(f"שגיאת בדיקת תור: {e}"))
+
+
+@bot.message_handler(commands=["version"])
+def cmd_version(m: types.Message):
+    bot.reply_to(m, nfc("גרסה: v2025-08-28T21:25:48"))
 
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
@@ -841,6 +845,7 @@ def on_prompt_id(m: types.Message):
 def on_receive_id_or_url(m: types.Message):
     txt = (m.text or "").strip()
     pid = None
+    import re
     import re as _re
     mobj = _re.search(r"/item/(\d+)\.html", txt)
     if mobj:
@@ -1163,6 +1168,21 @@ def run_polling():
         print(f"[{now_str()}] TIP: Use Webhook (set USE_WEBHOOK=true + WEBHOOK_BASE_URL) or ensure single instance.", flush=True)
 
 def main():
+
+    # ---- Single-instance lock (same host) ----
+    try:
+        os.makedirs(os.path.dirname(RUN_LOCK_PATH), exist_ok=True)
+        global _RUN_LOCK_FH
+        _RUN_LOCK_FH = open(RUN_LOCK_PATH, "w")
+        fcntl.flock(_RUN_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _RUN_LOCK_FH.write(str(os.getpid()))
+        _RUN_LOCK_FH.flush()
+        print(f"[{now_str()}] Lock acquired: {RUN_LOCK_PATH}", flush=True)
+    except BlockingIOError:
+        print(f"[{now_str()}] Another instance already holds lock {RUN_LOCK_PATH}. Exiting.", flush=True)
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"[{now_str()}] WARNING: lock setup failed: {e}. Continuing without single-instance guard.", flush=True)
     t = threading.Thread(target=poster_loop, daemon=True)
     t.start()
     if USE_WEBHOOK and WEBHOOK_BASE_URL:
