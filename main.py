@@ -770,6 +770,106 @@ def import_products_from_csv(path: str) -> (int, str):
     except Exception as e:
         return 0, f"שגיאה בקריאת CSV: {e}"
 
+# ========= בדיקות AliExpress (חמים / לפי ID / URL) =========
+@bot.message_handler(func=lambda msg: msg.text == "🔥 מוצרים חמים")
+def on_hot_products(m: types.Message):
+    try:
+        res = AE.hot_products(page_size=10)
+        items = res.get("items", [])
+        if not items:
+            hint = ""
+            if res.get("error"):
+                hint = f"\n(רמז מהשרת: {res.get('error')})"
+            dbg = res.get("_debug") or {}
+            if dbg:
+                hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
+            bot.reply_to(m, nfc("לא נמצאו פריטים חמים." + hint))
+            return
+        rows = []
+        for it in items:
+            rows.append({
+                "ProductId": it.get("productId") or "",
+                "Image Url": it.get("imageUrl") or "",
+                "Product Desc": it.get("title") or "",
+                "Opening": "",
+                "Title": it.get("title") or "",
+                "Strengths": "",
+                "Promotion Url": it.get("promotionUrl") or "",
+            })
+        added = append_to_queue(rows)
+        bot.reply_to(m, nfc(f"נוספו {added} פריטים חמים לתור."))
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאת חיפוש חמים: {e}"))
+
+@bot.message_handler(func=lambda msg: msg.text == "🔎 מוצר לפי ID")
+def on_prompt_id(m: types.Message):
+    msg = bot.reply_to(m, nfc("שלח/י עכשיו ProductId (מספר, למשל 4001234567890) או הדבק כתובת מוצר AliExpress."))
+    bot.register_next_step_handler(msg, on_receive_id_or_url)
+
+def on_receive_id_or_url(m: types.Message):
+    txt = (m.text or "").strip()
+    pid = None
+    # Try to extract from URL
+    import re as _re
+    mobj = _re.search(r"/item/(\d+)\.html", txt)
+    if mobj:
+        pid = mobj.group(1)
+    elif txt.isdigit():
+        pid = txt
+    if not pid:
+        bot.reply_to(m, nfc("לא זוהה ProductId תקין."))
+        return
+    try:
+        data = AE.get_product_detail(pid)
+        # Try to normalize like other calls
+        items = []
+        for path in [
+            ("resp_result","result","result"),
+            ("result","result"),
+            ("result","items"),
+            ("items",),
+        ]:
+            cur = data
+            for pth in path:
+                if isinstance(cur, dict):
+                    cur = cur.get(pth)
+                else:
+                    cur = None
+                    break
+            if isinstance(cur, list):
+                items = cur
+                break
+        if not items and isinstance(data, dict) and isinstance(data.get("result"), dict):
+            items = [data.get("result")]
+
+        if not items:
+            hint = ""
+            if isinstance(data, dict):
+                for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
+                    if data.get(k):
+                        hint = f"\n(רמז מהשרת: {data.get(k)})"; break
+                dbg = data.get("_debug") or {}
+                if dbg:
+                    hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
+            bot.reply_to(m, nfc(f"לא הוחזרו פרטים עבור המוצר {pid}.{hint}"))
+            return
+        # Convert one item to queue row
+        it = items[0] if isinstance(items, list) else items
+        row = {
+            "ProductId": it.get("productId") or it.get("target_id") or pid,
+            "Image Url": it.get("image") or it.get("image_url") or it.get("product_main_image_url") or "",
+            "Product Desc": it.get("product_title") or it.get("title") or it.get("subject") or "",
+            "Opening": "",
+            "Title": it.get("product_title") or it.get("title") or it.get("subject") or "",
+            "Strengths": "",
+            "Promotion Url": it.get("promotion_link") or it.get("promotionUrl") or it.get("target_url") or f"https://www.aliexpress.com/item/{pid}.html",
+        }
+        added = append_to_queue([row])
+        bot.reply_to(m, nfc(f"פרטי מוצר {pid} נוספו לתור ({added})."))
+
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאת פירוט מוצר: {e}"))
+
 # ========= משיכת מוצרים לתור =========
 @bot.message_handler(func=lambda msg: msg.text == "➕ משוך מוצרים")
 def on_fetch_to_queue(m: types.Message):
