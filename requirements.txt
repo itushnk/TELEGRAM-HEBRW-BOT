@@ -1,5 +1,4 @@
 pyTelegramBotAPI
-waitress
 requests
-
 flask
+waitress

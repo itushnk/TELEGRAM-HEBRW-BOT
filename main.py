@@ -770,106 +770,6 @@ def import_products_from_csv(path: str) -> (int, str):
     except Exception as e:
         return 0, f"שגיאה בקריאת CSV: {e}"
 
-# ========= בדיקות AliExpress (חמים / לפי ID / URL) =========
-@bot.message_handler(func=lambda msg: msg.text == "🔥 מוצרים חמים")
-def on_hot_products(m: types.Message):
-    try:
-        res = AE.hot_products(page_size=10)
-        items = res.get("items", [])
-        if not items:
-            hint = ""
-            if res.get("error"):
-                hint = f"\n(רמז מהשרת: {res.get('error')})"
-            dbg = res.get("_debug") or {}
-            if dbg:
-                hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc("לא נמצאו פריטים חמים." + hint))
-            return
-        rows = []
-        for it in items:
-            rows.append({
-                "ProductId": it.get("productId") or "",
-                "Image Url": it.get("imageUrl") or "",
-                "Product Desc": it.get("title") or "",
-                "Opening": "",
-                "Title": it.get("title") or "",
-                "Strengths": "",
-                "Promotion Url": it.get("promotionUrl") or "",
-            })
-        added = append_to_queue(rows)
-        bot.reply_to(m, nfc(f"נוספו {added} פריטים חמים לתור."))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת חיפוש חמים: {e}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "🔎 מוצר לפי ID")
-def on_prompt_id(m: types.Message):
-    msg = bot.reply_to(m, nfc("שלח/י עכשיו ProductId (מספר, למשל 4001234567890) או הדבק כתובת מוצר AliExpress."))
-    bot.register_next_step_handler(msg, on_receive_id_or_url)
-
-def on_receive_id_or_url(m: types.Message):
-    txt = (m.text or "").strip()
-    pid = None
-    # Try to extract from URL
-    import re as _re
-    mobj = _re.search(r"/item/(\d+)\.html", txt)
-    if mobj:
-        pid = mobj.group(1)
-    elif txt.isdigit():
-        pid = txt
-    if not pid:
-        bot.reply_to(m, nfc("לא זוהה ProductId תקין."))
-        return
-    try:
-        data = AE.get_product_detail(pid)
-        # Try to normalize like other calls
-        items = []
-        for path in [
-            ("resp_result","result","result"),
-            ("result","result"),
-            ("result","items"),
-            ("items",),
-        ]:
-            cur = data
-            for pth in path:
-                if isinstance(cur, dict):
-                    cur = cur.get(pth)
-                else:
-                    cur = None
-                    break
-            if isinstance(cur, list):
-                items = cur
-                break
-        if not items and isinstance(data, dict) and isinstance(data.get("result"), dict):
-            items = [data.get("result")]
-
-        if not items:
-            hint = ""
-            if isinstance(data, dict):
-                for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
-                    if data.get(k):
-                        hint = f"\n(רמז מהשרת: {data.get(k)})"; break
-                dbg = data.get("_debug") or {}
-                if dbg:
-                    hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc(f"לא הוחזרו פרטים עבור המוצר {pid}.{hint}"))
-            return
-        # Convert one item to queue row
-        it = items[0] if isinstance(items, list) else items
-        row = {
-            "ProductId": it.get("productId") or it.get("target_id") or pid,
-            "Image Url": it.get("image") or it.get("image_url") or it.get("product_main_image_url") or "",
-            "Product Desc": it.get("product_title") or it.get("title") or it.get("subject") or "",
-            "Opening": "",
-            "Title": it.get("product_title") or it.get("title") or it.get("subject") or "",
-            "Strengths": "",
-            "Promotion Url": it.get("promotion_link") or it.get("promotionUrl") or it.get("target_url") or f"https://www.aliexpress.com/item/{pid}.html",
-        }
-        added = append_to_queue([row])
-        bot.reply_to(m, nfc(f"פרטי מוצר {pid} נוספו לתור ({added})."))
-
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת פירוט מוצר: {e}"))
-
 # ========= משיכת מוצרים לתור =========
 @bot.message_handler(func=lambda msg: msg.text == "➕ משוך מוצרים")
 def on_fetch_to_queue(m: types.Message):
@@ -1050,43 +950,64 @@ if USE_WEBHOOK:
         bot.process_new_updates([update])
         return "OK", 200
 
+
+# ========= Webhook ONLY (no polling) =========
+USE_WEBHOOK = True
+WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").rstrip("/")
+WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
+from flask import Flask, request, abort
+app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
+def root_ok():
+    return "OK", 200
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook():
+    if WEBHOOK_SECRET:
+        secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if secret_hdr != WEBHOOK_SECRET:
+            return abort(403)
+    try:
+        data = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(data)
+    except Exception:
+        return abort(400)
+    bot.process_new_updates([update])
+    return "OK", 200
+
 def main():
-    # poster thread always runs (works with both polling and webhook)
+    # Run poster thread
     t = threading.Thread(target=poster_loop, daemon=True)
     t.start()
 
-    if USE_WEBHOOK and WEBHOOK_BASE_URL:
-        # Switch to webhook mode to avoid 409 conflicts.
-        try:
-            # Remove old webhook just in case, then set new one
-            try:
-                bot.delete_webhook(drop_pending_updates=True)
-            except Exception:
-                pass
-            full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
-            bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
-            port = int(os.environ.get("PORT", "8080"))
-            print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
-            from waitress import serve as _serve
-            _serve(app, host="0.0.0.0", port=port)
-            return
-        except Exception as e:
-            print(f"[{now_str()}] Webhook setup failed: {e}. Falling back to polling.", flush=True)
+    # Enforce webhook mode — never poll — to avoid 409
+    if not WEBHOOK_BASE_URL:
+        print(f"[{now_str()}] FATAL: WEBHOOK_BASE_URL is not set. Set a public https URL (e.g., https://your-app.example.com).", flush=True)
+        print(f"[{now_str()}] Exiting to prevent polling conflicts (409).", flush=True)
+        raise SystemExit(2)
 
-    # Fallback / default: polling
     try:
-        # Ensure webhook is removed when polling (prevents conflicts)
+        # Ensure previous webhook is cleared, then set our webhook
         try:
             bot.delete_webhook(drop_pending_updates=True)
         except Exception:
             pass
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-    except telebot.apihelper.ApiTelegramException as e:
-        print(f"[{now_str()}] Polling error: {e}", flush=True)
-        # If 409 conflict occurs repeatedly, advise switching to webhook mode
-        print(f"[{now_str()}] TIP: Set USE_WEBHOOK=true and WEBHOOK_BASE_URL to avoid 409 conflicts.", flush=True)
+        full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
+        bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
+        port = int(os.environ.get("PORT", "8080"))
+        print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
+        from waitress import serve as _serve
+        _serve(app, host="0.0.0.0", port=port)
     except Exception as e:
-        print(f"[{now_str()}] Polling crashed: {e}", flush=True)
+        print(f"[{now_str()}] FATAL webhook setup failed: {e}", flush=True)
+        raise SystemExit(3)
 
 if __name__ == "__main__":
     main()
