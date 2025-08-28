@@ -433,11 +433,11 @@ def build_post(row: Dict[str, Any]) -> str:
     strengths_field = nfc((row.get("Strengths") or "").strip())
     strengths_lines: List[str] = []
     if strengths_field:
-        import re
-    for part in re.split(r'[|\r\n]+', strengths_field):
+        for part in _re.split(r'[|\r\n]+', strengths_field):
             p = nfc(part.strip())
             if p:
                 strengths_lines.append(p)
+
 
     # Enrich with price/coupon info from uploaded columns if present
     currency = (row.get("Currency") or "").strip()
@@ -845,7 +845,6 @@ def on_prompt_id(m: types.Message):
 def on_receive_id_or_url(m: types.Message):
     txt = (m.text or "").strip()
     pid = None
-    import re
     import re as _re
     mobj = _re.search(r"/item/(\d+)\.html", txt)
     if mobj:
