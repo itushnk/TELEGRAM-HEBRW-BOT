@@ -580,6 +580,11 @@ def cmd_ae_diag(m: types.Message):
 
     bot.reply_to(m, nfc("\n".join(lines)))
 
+
+@bot.message_handler(commands=["version"])
+def cmd_version(m: types.Message):
+    bot.reply_to(m, nfc("גרסה: v2025-08-28T22:50Z-upload+webhook+diag"))
+
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
