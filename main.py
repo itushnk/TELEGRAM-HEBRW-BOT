@@ -951,63 +951,78 @@ if USE_WEBHOOK:
         return "OK", 200
 
 
-# ========= Webhook ONLY (no polling) =========
-USE_WEBHOOK = True
+# ========= Dual-mode: Webhook if available, else Polling =========
+USE_WEBHOOK = (os.environ.get("USE_WEBHOOK", "false").lower() in ("1","true","yes","on"))
 WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").rstrip("/")
 WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
-from flask import Flask, request, abort
-app = Flask(__name__)
+def run_webhook():
+    from flask import Flask, request, abort
+    app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def root_ok():
-    return "OK", 200
+    @app.route("/", methods=["GET"])
+    def root_ok():
+        return "OK", 200
 
-@app.route("/healthz", methods=["GET"])
-def healthz():
-    return "ok", 200
+    @app.route("/healthz", methods=["GET"])
+    def healthz():
+        return "ok", 200
 
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def telegram_webhook():
-    if WEBHOOK_SECRET:
-        secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-        if secret_hdr != WEBHOOK_SECRET:
-            return abort(403)
+    @app.route(WEBHOOK_PATH, methods=["POST"])
+    def telegram_webhook():
+        if WEBHOOK_SECRET:
+            secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+            if secret_hdr != WEBHOOK_SECRET:
+                return abort(403)
+        try:
+            data = request.get_data().decode("utf-8")
+            update = telebot.types.Update.de_json(data)
+        except Exception:
+            return abort(400)
+        bot.process_new_updates([update])
+        return "OK", 200
+
+    # clear old webhook and set new
     try:
-        data = request.get_data().decode("utf-8")
-        update = telebot.types.Update.de_json(data)
+        bot.delete_webhook(drop_pending_updates=True)
     except Exception:
-        return abort(400)
-    bot.process_new_updates([update])
-    return "OK", 200
+        pass
+
+    full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
+    bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
+    port = int(os.environ.get("PORT", "8080"))
+    print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
+    from waitress import serve as _serve
+    _serve(app, host="0.0.0.0", port=port)
+
+def run_polling():
+    # Ensure webhook removed while polling
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=30)
+    except telebot.apihelper.ApiTelegramException as e:
+        print(f"[{now_str()}] Polling error: {e}", flush=True)
+        print(f"[{now_str()}] TIP: Use Webhook (set USE_WEBHOOK=true + WEBHOOK_BASE_URL) or ensure single instance.", flush=True)
 
 def main():
-    # Run poster thread
+    # poster loop thread
     t = threading.Thread(target=poster_loop, daemon=True)
     t.start()
 
-    # Enforce webhook mode — never poll — to avoid 409
-    if not WEBHOOK_BASE_URL:
-        print(f"[{now_str()}] FATAL: WEBHOOK_BASE_URL is not set. Set a public https URL (e.g., https://your-app.example.com).", flush=True)
-        print(f"[{now_str()}] Exiting to prevent polling conflicts (409).", flush=True)
-        raise SystemExit(2)
-
-    try:
-        # Ensure previous webhook is cleared, then set our webhook
-        try:
-            bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-        full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
-        bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
-        port = int(os.environ.get("PORT", "8080"))
-        print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
-        from waitress import serve as _serve
-        _serve(app, host="0.0.0.0", port=port)
-    except Exception as e:
-        print(f"[{now_str()}] FATAL webhook setup failed: {e}", flush=True)
-        raise SystemExit(3)
+    # Decide mode
+    if USE_WEBHOOK and WEBHOOK_BASE_URL:
+        print(f"[{now_str()}] Mode: WEBHOOK", flush=True)
+        run_webhook()
+    else:
+        if USE_WEBHOOK and not WEBHOOK_BASE_URL:
+            print(f"[{now_str()}] USE_WEBHOOK set but WEBHOOK_BASE_URL missing → falling back to POLLING.", flush=True)
+        else:
+            print(f"[{now_str()}] Mode: POLLING", flush=True)
+        run_polling()
 
 if __name__ == "__main__":
     main()
