@@ -17,6 +17,12 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 import datetime as dt
 import requests
+import json
+# safe fcntl import
+try:
+    import fcntl  # POSIX only
+except Exception:
+    fcntl = None  # fallback for non-POSIX or missing module
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 # ---- Single-instance lock path (always defined, after BOT_TOKEN & imports) ----
@@ -39,6 +45,74 @@ from telebot import types
 
 # ========= קונפיג/נתיבים =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
+
+# ========= Persistent Config (channel & admin) =========
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json") if "BASE_DIR" in globals() else os.path.join(os.getcwd(), "config.json")
+
+def _cfg_load() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _cfg_save(cfg: dict) -> None:
+    try:
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+    except Exception as e:
+        print(f"[{now_str()}] Failed saving config: {e}", flush=True)
+
+GLOBAL_CONFIG = _cfg_load()
+
+def is_admin(user_id: int) -> bool:
+    try:
+        env_admin = os.getenv("ADMIN_USER_ID", "").strip()
+        if env_admin:
+            try:
+                if int(env_admin) == int(user_id):
+                    return True
+            except Exception:
+                pass
+        owner = GLOBAL_CONFIG.get("admin_user_id")
+        if owner is not None:
+            return int(owner) == int(user_id)
+        # If not set, allow first setter to become admin
+        return True
+    except Exception:
+        return False
+
+def ensure_admin(user_id: int):
+    # Set first admin if not set
+    if GLOBAL_CONFIG.get("admin_user_id") is None:
+        GLOBAL_CONFIG["admin_user_id"] = int(user_id)
+        _cfg_save(GLOBAL_CONFIG)
+
+def set_channel_binding(kind: str, value: str, setter_id: int):
+    # kind: "public" or "private"
+    GLOBAL_CONFIG["channel_type"] = "public" if kind == "public" else "private"
+    GLOBAL_CONFIG["channel_id"] = str(value)
+    ensure_admin(setter_id)
+    _cfg_save(GLOBAL_CONFIG)
+
+def get_current_channel_id():
+    # preference: config file → env → empty
+    cid = (GLOBAL_CONFIG.get("channel_id") or os.getenv("CHANNEL_ID", "")).strip()
+    return cid
+
+def parse_chat_id(cid: str):
+    cid = str(cid).strip()
+    if not cid:
+        return cid
+    if cid.startswith("@"):
+        return cid  # public channel username
+    # numeric id (private/public)
+    try:
+        return int(cid)
+    except Exception:
+        return cid
 EMPTY_QUEUE_SLEEP = int(os.getenv("EMPTY_QUEUE_SLEEP", "300"))  # seconds to wait when queue is empty
 os.makedirs(BASE_DIR, exist_ok=True)
 
@@ -524,13 +598,13 @@ def build_post(row: Dict[str, Any]) -> str:
 def try_post_row(row: Dict[str, Any]) -> bool:
     msg = build_post(row)
     try:
-        if not CHANNEL_ID:
-            print("WARNING: חסר CHANNEL_ID — לא ניתן לשלוח לערוץ.", flush=True)
+        if not get_current_channel_id():
+            print("WARNING: חסר CHANNEL_ID/הגדרה בקובץ config (הגדר דרך ⚙️ הגדרות ערוץ או משתנה סביבה) — לא ניתן לשלוח לערוץ.", flush=True)
             return False
-        bot.send_message(CHANNEL_ID, msg, disable_web_page_preview=False)
+        bot.send_message(parse_chat_id(get_current_channel_id()), msg, disable_web_page_preview=False)
         img = (row.get("Image Url") or "").strip()
         if img:
-            bot.send_photo(CHANNEL_ID, img)
+            bot.send_photo(parse_chat_id(get_current_channel_id()), img)
         return True
     except telebot.apihelper.ApiTelegramException as e:
         print(f"[{now_str()}] Telegram API error: {e}", flush=True)
@@ -621,6 +695,74 @@ def cmd_queue_status(m: types.Message):
 def cmd_version(m: types.Message):
     bot.reply_to(m, nfc("גרסה: v2025-08-28T21:25:48"))
 
+
+@bot.message_handler(commands=["env_channels"])
+def cmd_env_channels(m: types.Message):
+    try:
+        cid_cfg = GLOBAL_CONFIG.get("channel_id")
+        cid_env = os.getenv("CHANNEL_ID", "")
+        ctype = GLOBAL_CONFIG.get("channel_type")
+        owner = GLOBAL_CONFIG.get("admin_user_id")
+        bot.reply_to(m, nfc(f"config.channel_id={cid_cfg}\nenv.CHANNEL_ID={cid_env}\nchannel_type={ctype}\nadmin_user_id={owner}"))
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאת env: {e}"))
+
+
+def build_main_menu_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(types.KeyboardButton("🗂️ ניהול תור"), types.KeyboardButton("➕ משוך מוצרים"))
+    kb.add(types.KeyboardButton("📤 העלאת קובץ"), types.KeyboardButton("🚀 פרסם עכשיו"))
+    kb.add(types.KeyboardButton("🔥 מוצרים חמים"), types.KeyboardButton("🔎 מוצר לפי ID"))
+    kb.add(types.KeyboardButton("⚙️ הגדרות ערוץ"))
+    return kb
+
+@bot.message_handler(commands=["menu","start","help"])
+def cmd_menu(m: types.Message):
+    kb = build_main_menu_kb()
+    bot.reply_to(m, nfc("תפריט ראשי"), reply_markup=kb)
+
+@bot.message_handler(commands=["settings"])
+def cmd_settings(m: types.Message):
+    if not is_admin(m.from_user.id):
+        bot.reply_to(m, nfc("אין הרשאה לפתוח הגדרות ערוץ."))
+        return
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(types.KeyboardButton("🔓 קבע ערוץ ציבורי (@username)"))
+    kb.add(types.KeyboardButton("🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)"))
+    kb.add(types.KeyboardButton("ℹ️ מצב ערוץ נוכחי"))
+    bot.reply_to(m, nfc("בחר/י פעולה לערוץ:"), reply_markup=kb)
+
+
+@bot.message_handler(commands=["set_public"])
+def cmd_set_public(m: types.Message):
+    if not is_admin(m.from_user.id):
+        bot.reply_to(m, nfc("אין הרשאה.")); return
+    parts = (m.text or "").split()
+    if len(parts) < 2 or not parts[1].startswith("@"):
+        bot.reply_to(m, nfc("שימוש: /set_public @channel_username"))
+        return
+    set_channel_binding("public", parts[1], m.from_user.id)
+    bot.reply_to(m, nfc(f"הוגדר ערוץ ציבורי: {parts[1]}"))
+
+@bot.message_handler(commands=["set_private"])
+def cmd_set_private(m: types.Message):
+    if not is_admin(m.from_user.id):
+        bot.reply_to(m, nfc("אין הרשאה.")); return
+    parts = (m.text or "").split()
+    if len(parts) < 2:
+        bot.reply_to(m, nfc("שימוש: /set_private -100xxxxxxxxxx  (או שלח הודעה מועברת מהערוץ דרך הכפתור)"))
+        return
+    val = parts[1].strip()
+    try:
+        if not val.startswith("-100"):
+            raise ValueError("Chat ID צריך להתחיל ב-100-")
+        int(val)  # validate numeric
+    except Exception:
+        bot.reply_to(m, nfc("Chat ID לא תקין. דוגמה: -1001234567890"))
+        return
+    set_channel_binding("private", val, m.from_user.id)
+    bot.reply_to(m, nfc(f"הוגדר ערוץ פרטי: {val}"))
+
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -629,6 +771,7 @@ def make_main_kb() -> types.ReplyKeyboardMarkup:
     row3 = [types.KeyboardButton("🔄 טען מחדש את התור"), types.KeyboardButton("🧪 בדיקת AliExpress"), types.KeyboardButton("🛠️ אבחון AliExpress")]
     row4 = [types.KeyboardButton("🗂️ ניהול תור"), types.KeyboardButton("➕ משוך מוצרים"), types.KeyboardButton("📤 העלאת קובץ")]
     kb.add(*row1); kb.add(*row2); kb.add(*row3); kb.add(*row4)
+    kb.add(types.KeyboardButton("⚙️ הגדרות ערוץ"))
     kb.add(types.KeyboardButton("🔥 מוצרים חמים"))
     kb.add(types.KeyboardButton("🔎 מוצר לפי ID"))
     return kb
@@ -929,9 +1072,9 @@ def publish_next() -> bool:
         link  = (row.get("Promotion Url") or "").strip()
         # If there's an image URL, try photo; else send text
         if image:
-            bot.send_photo(CHANNEL_ID, image, caption=text, parse_mode="HTML", disable_web_page_preview=True)
+            bot.send_photo(parse_chat_id(get_current_channel_id()), image, caption=text, parse_mode="HTML", disable_web_page_preview=True)
         else:
-            bot.send_message(CHANNEL_ID, text, parse_mode="HTML", disable_web_page_preview=True)
+            bot.send_message(parse_chat_id(get_current_channel_id()), text, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         print(f"[{now_str()}] Failed to post: {e}", flush=True)
         return False
@@ -939,6 +1082,75 @@ def publish_next() -> bool:
     rest = rows[1:]
     write_csv_rows(QUEUE_CSV, rest, fieldnames=list(rows[0].keys()))
     return True
+
+
+# ========= Channel Settings =========
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ הגדרות ערוץ")
+def on_channel_settings(m: types.Message):
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    kb.add(types.KeyboardButton("🔓 קבע ערוץ ציבורי (@username)"))
+    kb.add(types.KeyboardButton("🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)"))
+    kb.add(types.KeyboardButton("ℹ️ מצב ערוץ נוכחי"))
+    bot.reply_to(m, nfc("בחר/י פעולה לערוץ:"), reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: msg.text == "ℹ️ מצב ערוץ נוכחי")
+def on_channel_status(m: types.Message):
+    cid = get_current_channel_id() or "(לא הוגדר)"
+    ctype = GLOBAL_CONFIG.get("channel_type") or ("public" if str(cid).startswith("@") else "private" if str(cid).startswith("-100") else "(לא ידוע)")
+    owner = GLOBAL_CONFIG.get("admin_user_id")
+    bot.reply_to(m, nfc(f"ערוץ נוכחי: {cid}\nסוג: {ctype}\nמנהל: {owner if owner else '(לא הוגדר)'}"))
+
+@bot.message_handler(func=lambda msg: msg.text == "🔓 קבע ערוץ ציבורי (@username)")
+def on_set_public_prompt(m: types.Message):
+    bot.reply_to(m, nfc("שלח/י עכשיו @שם_הערוץ הציבורי (למשל @best_deals)."))
+    bot.register_next_step_handler(m, on_set_public_value)
+
+def on_set_public_value(m: types.Message):
+    try:
+        if not is_admin(m.from_user.id):
+            bot.reply_to(m, nfc("אין הרשאה לביצוע פעולה זו."))
+            return
+        txt = (m.text or "").strip()
+        if not txt.startswith("@") or " " in txt or len(txt) < 3:
+            bot.reply_to(m, nfc("שם משתמש לא תקין. שלח/י שוב במבנה @channel_name."))
+            return
+        set_channel_binding("public", txt, m.from_user.id)
+        bot.reply_to(m, nfc(f"הוגדר ערוץ ציבורי: {txt}\nודא/י שהבוט אדמין בערוץ עם הרשאת פרסום."))
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאה בהגדרת ערוץ ציבורי: {e}"))
+
+@bot.message_handler(func=lambda msg: msg.text == "🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)")
+def on_set_private_prompt(m: types.Message):
+    bot.reply_to(m, nfc("מעולה. העבר/י כעת הודעה מהערוץ שאליו ננעל. (Forward מהערוץ לכאן)"))
+    bot.register_next_step_handler(m, on_set_private_value)
+
+def _extract_channel_id_from_message(msg: types.Message):
+    # Try multiple attributes because Telegram can populate different fields
+    try:
+        if getattr(msg, "forward_from_chat", None) and getattr(msg.forward_from_chat, "type", "") == "channel":
+            return msg.forward_from_chat.id, getattr(msg.forward_from_chat, "title", None)
+        if getattr(msg, "sender_chat", None) and getattr(msg.sender_chat, "type", "") == "channel":
+            return msg.sender_chat.id, getattr(msg.sender_chat, "title", None)
+        # If user posts directly from channel via bot (rare), msg.chat might be the channel
+        if getattr(msg, "chat", None) and getattr(msg.chat, "type", "") == "channel":
+            return msg.chat.id, getattr(msg.chat, "title", None)
+    except Exception:
+        pass
+    return None, None
+
+def on_set_private_value(m: types.Message):
+    try:
+        if not is_admin(m.from_user.id):
+            bot.reply_to(m, nfc("אין הרשאה לביצוע פעולה זו."))
+            return
+        cid, title = _extract_channel_id_from_message(m)
+        if not cid:
+            bot.reply_to(m, nfc("לא הצלחתי לזהות את הערוץ מההודעה. ודא/י שזה Forward אמיתי מהערוץ."))
+            return
+        set_channel_binding("private", str(cid), m.from_user.id)
+        bot.reply_to(m, nfc(f"הוגדר ערוץ פרטי: {cid}\nכותרת: {title or ''}\nהבוט חייב להיות אדמין בערוץ."))
+    except Exception as e:
+        bot.reply_to(m, nfc(f"שגיאה בהגדרת ערוץ פרטי: {e}"))
 
 # ========= משיכת מוצרים לתור =========
 @bot.message_handler(func=lambda msg: msg.text == "➕ משוך מוצרים")
@@ -1181,6 +1393,8 @@ def main():
     try:
         os.makedirs(os.path.dirname(RUN_LOCK_PATH), exist_ok=True)
         global _RUN_LOCK_FH
+        if fcntl is None:
+            raise RuntimeError("fcntl not available")
         _RUN_LOCK_FH = open(RUN_LOCK_PATH, "w")
         fcntl.flock(_RUN_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         _RUN_LOCK_FH.write(str(os.getpid()))
