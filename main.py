@@ -14,6 +14,7 @@ import os, sys, csv, json, time, socket, threading, unicodedata, hmac, hashlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
+import datetime as dt
 
 # ========= פלט מיידי ללוגים =========
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -460,7 +461,7 @@ def build_post(row: Dict[str, Any]) -> str:
         fmts = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"]
         for fmt in fmts:
             try:
-                return datetime.datetime.strptime(s, fmt).replace(tzinfo=TZ)
+                return dt.datetime.strptime(s, fmt).replace(tzinfo=TZ)
             except Exception:
                 pass
         return None
@@ -470,7 +471,7 @@ def build_post(row: Dict[str, Any]) -> str:
         valid = ""
         dt_start = parse_dt(code_start) if code_start else None
         dt_end = parse_dt(code_end) if code_end else None
-        now = datetime.datetime.now(TZ)
+        now = dt.datetime.now(TZ)
         if dt_start and dt_end:
             if dt_start <= now <= dt_end:
                 valid = f"(תקף עד {dt_end.strftime('%d.%m.%Y %H:%M')})"
@@ -580,14 +581,11 @@ def cmd_ae_diag(m: types.Message):
     bot.reply_to(m, nfc("\n".join(lines)))
 
 
-@bot.message_handler(commands=["version"])
-def cmd_version(m: types.Message):
-    bot.reply_to(m, nfc("גרסה: v2025-08-28T22:50Z-upload+webhook+diag"))
 
 
 @bot.message_handler(commands=["version"])
 def cmd_version(m: types.Message):
-    bot.reply_to(m, nfc("גרסה: v2025-08-28T20:07:20"))
+    bot.reply_to(m, nfc("גרסה: v2025-08-28T20:27:38"))
 
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
@@ -712,7 +710,7 @@ def on_document_upload(m: types.Message):
     try:
         file_info = bot.get_file(m.document.file_id)
         data = bot.download_file(file_info.file_path)
-        ts = datetime.datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
+        ts = dt.datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
         save_path = os.path.join(UPLOADS_DIR, f"{ts}-{filename or 'upload.csv'}")
         with open(save_path, "wb") as f:
             f.write(data)
@@ -810,8 +808,7 @@ def do_fetch_keyword(m: types.Message):
         bot.reply_to(m, nfc(f"נוספו {added} פריטים לתור מתוך החיפוש ל־“{kw}”"))
     except Exception as e:
         bot.reply_to(m, nfc(f"שגיאה במשיכה: {e}"))
-# ========= ניהול תור
- (עיון/מחיקה) =========
+# ========= ניהול תור (עיון/מחיקה) =========
 BROWSE_INDEX: Dict[int, int] = {}  # chat_id -> index להצגה
 
 @bot.message_handler(func=lambda msg: msg.text == "🗂️ ניהול תור")
