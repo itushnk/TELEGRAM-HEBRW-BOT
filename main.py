@@ -429,8 +429,8 @@ def build_post(row: Dict[str, Any]) -> str:
     strengths_field = nfc((row.get("Strengths") or "").strip())
     strengths_lines: List[str] = []
     if strengths_field:
-        for part in strengths_field.replace("|", "
-").splitlines():
+        import re
+    for part in re.split(r'[|\r\n]+', strengths_field):
             p = nfc(part.strip())
             if p:
                 strengths_lines.append(p)
