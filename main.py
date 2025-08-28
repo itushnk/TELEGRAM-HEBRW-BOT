@@ -18,6 +18,7 @@ from typing import Dict, Any, Optional, List
 import datetime as dt
 import requests
 import json
+import time
 # safe fcntl import
 try:
     import fcntl  # POSIX only
@@ -1085,7 +1086,8 @@ def publish_next() -> bool:
 
 
 
-from telebot import types as _types  # alias for inline keyboards
+from telebot import types as _types
+from telebot import apihelper as _apihelper  # alias for inline keyboards
 
 def open_inline_settings(chat_id: int):
     ikb = _types.InlineKeyboardMarkup(row_width=1)
@@ -1425,6 +1427,80 @@ def run_polling():
         print(f"[{now_str()}] Polling error: {e}", flush=True)
         print(f"[{now_str()}] TIP: Use Webhook (set USE_WEBHOOK=true + WEBHOOK_BASE_URL) or ensure single instance.", flush=True)
 
+
+# ========= Start helpers (polling/webhook with auto-switch) =========
+def start_webhook():
+    base_url = (os.getenv("WEBHOOK_BASE_URL") or "").rstrip("/")
+    secret = os.getenv("WEBHOOK_SECRET", "hook")
+    port = int(os.getenv("PORT", "8080"))
+    if not base_url:
+        print(f"[{now_str()}] FATAL: WEBHOOK_BASE_URL is not set. Falling back to POLLING.", flush=True)
+        return False
+
+    path = f"/webhook/{BOT_TOKEN}"
+    listen = ("0.0.0.0", port)
+    try:
+        from flask import Flask, request, abort
+        app = Flask(__name__)
+
+        @app.route(path, methods=["POST"])
+        def tg_webhook():
+            if secret and request.headers.get("X-Telegram-Bot-Secret-Token") != secret:
+                abort(403)
+            update = request.stream.read().decode("utf-8")
+            bot.process_new_updates([types.Update.de_json(update)])
+            return "OK"
+
+        # Set webhook
+        bot.remove_webhook()
+        bot.set_webhook(url=base_url + path, secret_token=secret, drop_pending_updates=True)
+        print(f"[{now_str()}] Mode: WEBHOOK", flush=True)
+        print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {base_url}{path}", flush=True)
+
+        # Production WSGI (waitress) if available
+        try:
+            from waitress import serve
+            serve(app, host=listen[0], port=listen[1])
+        except Exception:
+            app.run(host=listen[0], port=listen[1])
+        return True
+    except Exception as e:
+        print(f"[{now_str()}] Webhook start failed: {e}", flush=True)
+        return False
+
+
+def start_polling_with_auto_switch():
+    """
+    Start polling. If a 409 Conflict occurs and AUTO_SWITCH_WEBHOOK=true and WEBHOOK_BASE_URL configured,
+    automatically switch to webhook mode.
+    """
+    auto = (os.getenv("AUTO_SWITCH_WEBHOOK", "true").lower() in ("1","true","yes","on"))
+    base_url = (os.getenv("WEBHOOK_BASE_URL") or "").rstrip("/")
+    try:
+        print(f"[{now_str()}] Mode: POLLING", flush=True)
+        # Note: long_polling_timeout prevents frequent calls
+        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
+    except _apihelper.ApiTelegramException as e:
+        if getattr(e, "error_code", None) == 409:
+            print(f"[{now_str()}] POLLING 409 Conflict detected.", flush=True)
+            if auto and base_url:
+                print(f"[{now_str()}] AUTO_SWITCH_WEBHOOK enabled and WEBHOOK_BASE_URL present → switching to WEBHOOK.", flush=True)
+                ok = start_webhook()
+                if ok:
+                    return
+                else:
+                    print(f"[{now_str()}] Webhook switch failed; re-trying polling in 15s.", flush=True)
+                    time.sleep(15)
+                    return start_polling_with_auto_switch()
+            else:
+                print(f"[{now_str()}] To auto-switch set AUTO_SWITCH_WEBHOOK=true and WEBHOOK_BASE_URL=https://...", flush=True)
+                raise
+        else:
+            print(f"[{now_str()}] Polling exception: {e}", flush=True)
+            raise
+    except Exception as e:
+        print(f"[{now_str()}] Polling crashed: {e}", flush=True)
+        raise
 def main():
 
     # ---- Single-instance lock (same host) ----
