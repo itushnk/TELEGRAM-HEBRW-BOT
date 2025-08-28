@@ -216,11 +216,20 @@ try:
 except Exception:
     pass  # נשתמש ב-requests כשיהיה זמין
 
+API_ENDPOINTS = ["https://api-sg.aliexpress.com/sync", "https://api-sg.aliexpress.com/rest", "https://api.aliexpress.com/sync"]
+
+# Ensure requests session has a UA to avoid anti-bot filters
+if SESSION is not None:
+    try:
+        SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; AE-Bot/1.0)", "Accept": "application/json"})
+    except Exception:
+        pass
+
 class AliExpressAffiliateClient:
     """
     לקוח אפיליאייטים מלא עם ניסיונות חתימה/טיימסטמפ וגיבוי שפה/מטבע.
     """
-    _ENDPOINT = "https://api-sg.aliexpress.com/sync"
+    _ENDPOINT = API_ENDPOINTS[0]
 
     def __init__(self, app_key: Optional[str] = None, app_secret: Optional[str] = None, tracking_id: Optional[str] = None):
         self.app_key = (app_key or AE_APP_KEY)
@@ -251,29 +260,38 @@ class AliExpressAffiliateClient:
     def _call_once(self, method: str, biz_params: Dict[str, Any], sign_method: str, ts_mode: str) -> Dict[str, Any]:
         if SESSION is None:
             raise RuntimeError("requests not available in this environment.")
-        frame = {
-            "app_key": self.app_key,
-            "method": method,
-            "format": "json",
-            "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
-            "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
-            "v": "1.0",
-        }
-        merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
-        # Build sign params without 'sign'
-        sign_params = {k: merged[k] for k in merged if k != "sign"}
-        if sign_method.lower() == "hmac":
-            merged["sign"] = self._sign_hmac_sha256(sign_params)
-        else:
-            merged["sign"] = self._sign_md5(sign_params)
-        r = SESSION.get(self._ENDPOINT, params=merged, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        # Attach debug info to help upstream callers
-        if isinstance(data, dict):
-            data.setdefault("_debug", {})["sign_method_used"] = frame["sign_method"]
-            data["_debug"]["timestamp_mode"] = ts_mode
-        return data
+        last_exc = None
+        for ep in API_ENDPOINTS:
+            try:
+                frame = {
+                    "app_key": self.app_key,
+                    "method": method,
+                    "format": "json",
+                    "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
+                    "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
+                    "v": "1.0",
+                }
+                merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
+                sign_params = {k: merged[k] for k in merged if k != "sign"}
+                if sign_method.lower() == "hmac":
+                    merged["sign"] = self._sign_hmac_sha256(sign_params)
+                else:
+                    merged["sign"] = self._sign_md5(sign_params)
+                r = SESSION.get(ep, params=merged, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, dict):
+                    data.setdefault("_debug", {})["endpoint"] = ep
+                    data["_debug"]["sign_method_used"] = frame["sign_method"]
+                    data["_debug"]["timestamp_mode"] = ts_mode
+                return data
+            except Exception as e:
+                last_exc = e
+                continue
+        if last_exc:
+            raise last_exc
+        return {}
+
 
     def _call(self, method: str, biz_params: Dict[str, Any]) -> Dict[str, Any]:
         # Try multiple combos to survive doc variations between endpoints/apps
@@ -459,12 +477,46 @@ def post_next_from_queue() -> (bool, str):
         else:
             return False, "שליחה נכשלה (ראה לוג)."
 
+
+# ========= אבחון AliExpress =========
+@bot.message_handler(commands=["ae_diag"])
+def cmd_ae_diag(m: types.Message):
+    lines = []
+    try:
+        ak = (AE_APP_KEY or "")
+        tid = (AE_TRACKING_ID or "")
+        lines.append("בדיקת הגדרות AliExpress:")
+        lines.append(f"• app_key: {ak[:3]}***{ak[-3:] if len(ak)>6 else ''}")
+        lines.append(f"• tracking_id: {tid[:3]}***{tid[-3:] if len(tid)>6 else ''}")
+        lines.append(f"• target_language/currency: {AE_TARGET_LANGUAGE}/{AE_TARGET_CURRENCY}")
+        lines.append(f"• ship_to: {AE_SHIP_TO_COUNTRY}")
+        lines.append("מבצע קריאת בדיקה...")
+
+        try:
+            res = AE.search_products("test", page_size=1)
+            items = res.get("items", [])
+            dbg = res.get("_debug", {})
+            if items:
+                lines.append("✅ חיפוש החזיר תוצאה אחת לפחות.")
+            else:
+                lines.append("⚠️ אין תוצאות. ייתכן שזו מגבלת חשבון/מעקב או שגיאת חתימה.")
+            if dbg:
+                lines.append(f"debug: sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')} ep={dbg.get('endpoint')}")
+            if res.get("error"):
+                lines.append(f"server hint: {res.get('error')}")
+        except Exception as e:
+            lines.append(f"❌ שגיאת קריאת API: {e}")
+    except Exception as e:
+        lines.append(f"שגיאה פנימית: {e}")
+
+    bot.reply_to(m, nfc("\n".join(lines)))
+
 # ========= תפריט /start =========
 def make_main_kb() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     row1 = [types.KeyboardButton("🚀 פרסם עכשיו"), types.KeyboardButton("📜 מצב תור")]
     row2 = [types.KeyboardButton("⏱️ שינוי דיליי"), types.KeyboardButton("🔁 מצב אוטומטי")]
-    row3 = [types.KeyboardButton("🔄 טען מחדש את התור"), types.KeyboardButton("🧪 בדיקת AliExpress")]
+    row3 = [types.KeyboardButton("🔄 טען מחדש את התור"), types.KeyboardButton("🧪 בדיקת AliExpress"), types.KeyboardButton("🛠️ אבחון AliExpress")]
     row4 = [types.KeyboardButton("🗂️ ניהול תור"), types.KeyboardButton("➕ משוך מוצרים")]
     kb.add(*row1); kb.add(*row2); kb.add(*row3); kb.add(*row4)
     return kb
@@ -537,6 +589,7 @@ def on_delay_value(m: types.Message):
 
 # ========= בדיקת AliExpress =========
 @bot.message_handler(func=lambda msg: msg.text == "🧪 בדיקת AliExpress")
+@bot.message_handler(func=lambda msg: msg.text == "🛠️ אבחון AliExpress")
 def on_test_ae(m: types.Message):
     msg = bot.reply_to(m, nfc("שלח מילת חיפוש קצרה (למשל: bluetooth speaker):"))
     bot.register_next_step_handler(msg, do_test_ae_keyword)
