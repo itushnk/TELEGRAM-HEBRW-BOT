@@ -9,6 +9,18 @@ main.py — גרסה יציבה ומלאה:
 - לולאת שידור אוטומטי אחידה עם דיליי, "שעות שקטות" אופציונליות
 - נרמול טקסט ואימוג'ים (NFC) לכל הפלט
 """
+# ---- Single-instance lock path (always defined) ----
+try:
+    _tok_for_lock = BOT_TOKEN or os.getenv("BOT_TOKEN", "")
+except NameError:
+    _tok_for_lock = os.getenv("BOT_TOKEN", "")
+try:
+    RUN_LOCK_PATH = os.getenv("RUN_LOCK_PATH")
+    if not RUN_LOCK_PATH:
+        RUN_LOCK_PATH = f"/tmp/tg-bot-{hashlib.sha1(_tok_for_lock.encode('utf-8')).hexdigest()[:8]}.lock"
+except Exception:
+    RUN_LOCK_PATH = os.getenv("RUN_LOCK_PATH") or "/tmp/tg-bot.lock"
+
 
 import os, sys, csv, json, time, socket, threading, unicodedata, hmac, hashlib
 from datetime import datetime
