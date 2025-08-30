@@ -1360,7 +1360,7 @@ def handle_category_fetch(message, category_id, name):
     try:
         added = fetch_products_by_category(category_id)
         count = count_pending_queue()
-        bot.reply_to(message, f"✅ נוספו {added} מוצרים לקטגוריה {name}.
+        bot.reply_to(message, f"✅ נוספו {added} מוצרים לקטגוריה {name}.\n📦 כעת יש בתור: {count} פריטים.")
 📦 כעת יש בתור: {count} פריטים.")
     except Exception as e:
         bot.reply_to(message, f"שגיאה בשאיבה: {e}")
