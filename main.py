@@ -10,6 +10,7 @@ import csv
 import requests
 import time
 import telebot
+from aliexpress import fetch_products_by_category
 from telebot import types
 import threading
 from datetime import datetime, timedelta, time as dtime
@@ -37,37 +38,31 @@ PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
 CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 
-
-from aliexpress import fetch_products_by_category
-
-# קובץ נעילה להפעלת/כיבוי הבוט כולו
-BOT_LOCK_FILE = os.path.join(BASE_DIR, "bot.lock")
-
-def is_bot_locked():
-    return os.path.exists(BOT_LOCK_FILE)
-
-def toggle_bot_lock():
-    if is_bot_locked():
-        os.remove(BOT_LOCK_FILE)
-        return False
-    else:
-        with open(BOT_LOCK_FILE, "w") as f:
-            f.write("locked")
-        return True
-
-def count_pending_queue():
-    path = os.path.join(BASE_DIR, "queue.csv")
-    if not os.path.exists(path):
-        return 0
-    with open(path, encoding="utf-8-sig") as f:
-        return sum(1 for line in f) - 1  # header
-
-
 # שער ברירת מחדל
 USD_TO_ILS_RATE_DEFAULT = 3.55
 
 # נעילה למופע יחיד
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
+
+# --- Global bot ON/OFF ---
+def is_bot_locked() -> bool:
+    try:
+        return os.path.exists(LOCK_PATH)
+    except Exception:
+        return False
+
+def toggle_bot_lock() -> bool:
+    try:
+        if os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+            return False
+        else:
+            with open(LOCK_PATH, "w", encoding="utf-8") as f:
+                f.write("off")
+            return True
+    except Exception as e:
+        print(f"[WARN] toggle_bot_lock failed: {e}", flush=True)
+        return is_bot_locked()
 
 # ========= INIT =========
 if not BOT_TOKEN:
@@ -212,22 +207,53 @@ def read_products(path):
         return rows
 
 def write_products(path, rows):
-    base_headers = [
-        "ItemId","ImageURL","Title","OriginalPrice","SalePrice","Discount",
-        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths"
-    ]
-    if not rows:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=base_headers)
-            w.writeheader()
-        return
-    headers = list(dict.fromkeys(base_headers + [k for r in rows for k in r.keys()]))
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
+
+# ---- AliExpress helpers ----
+def usd_to_ils(amount_text, rate=None):
+    try:
+        amount = float(str(amount_text).replace("$","").strip())
+        r = rate or USD_TO_ILS_RATE_DEFAULT
+        return f"{amount * r:.2f}"
+    except Exception:
+        return str(amount_text)
+
+def normalize_ae_product(p, rate=None):
+    item_id = str(p.get("product_id") or p.get("item_id") or p.get("id") or "")
+    title_en = (p.get("product_title") or p.get("title") or "").strip()
+    sale_usd = p.get("app_sale_price") or p.get("sale_price") or p.get("price")
+    orig_usd = p.get("original_price") or p.get("orig_price") or sale_usd
+    sale_ils = usd_to_ils(sale_usd, rate)
+    orig_ils = usd_to_ils(orig_usd, rate)
+    discount = p.get("discount") or ""
+    rating = p.get("evaluate_rate") or p.get("rating") or ""
+    orders = p.get("orders") or p.get("orders_count") or ""
+    image = p.get("product_main_image_url") or p.get("image_url") or ""
+    link = p.get("product_detail_url") or p.get("detail_url") or p.get("url") or ""
+
+    opening = "מציאה שאסור לפספס! 🔥"
+    strengths = "✨ איכות גבוהה\n🚚 משלוח לישראל\n🛡️ אחריות מוכר"
+
+    return {
+        "ItemId": item_id,
+        "ImageURL": image,
+        "Title": title_en,
+        "OriginalPrice": orig_ils,
+        "SalePrice": sale_ils,
+        "Discount": f"{discount}%" if discount and not str(discount).endswith("%") else (discount or ""),
+        "Rating": rating,
+        "Orders": orders,
+        "BuyLink": link,
+        "CouponCode": "",
+        "Opening": opening,
+        "Video Url": "",
+        "Strengths": strengths
+    }
+
+def append_to_pending(rows):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        write_products(PENDING_CSV, pending + rows)
 def init_pending():
     if not os.path.exists(PENDING_CSV):
         src = read_products(DATA_CSV)
@@ -641,6 +667,12 @@ def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
 def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
+    # עליאקספרס – שאיבה לפי קטגוריות
+    kb.add(types.InlineKeyboardButton("🛍 עליאקספרס: קטגוריות", callback_data="ae_menu"))
+
+    # שליטה כללית בבוט
+    kb.add(types.InlineKeyboardButton("🔌 כיבוי/הפעלה של הבוט", callback_data="bot_toggle"))
+
     # פעולות
     
     kb.add(
@@ -705,15 +737,63 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
+    if is_bot_locked() and (c.data or '') != 'bot_toggle':
+        bot.answer_callback_query(c.id, 'הבוט כבוי כרגע.', show_alert=True)
+        return
     global POST_DELAY_SECONDS, CURRENT_TARGET
     if not _is_admin(c.message):
         bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
         return
 
     data = c.data or ""
+
+    if data == "ae_menu":
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            types.InlineKeyboardButton("🪔 תאורה", callback_data="ae_cat_100003109"),
+            types.InlineKeyboardButton("🧸 ילדים", callback_data="ae_cat_1501"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("💻 גאדג'טים", callback_data="ae_cat_5090301"),
+            types.InlineKeyboardButton("👕 בגדים", callback_data="ae_cat_200003482"),
+        )
+        kb.add(types.InlineKeyboardButton("🛠 כלי עבודה", callback_data="ae_cat_3227"))
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="בחר קטגוריה לשאיבה מעליאקספרס (נשלח לישראל):",
+                          reply_markup=kb, cb_id=c.id)
+        return
+
+    if data.startswith("ae_cat_"):
+        if is_bot_locked():
+            bot.answer_callback_query(c.id, "הבוט כבוי כרגע. הפעל אותו מהתפריט.", show_alert=True)
+            return
+        cat = data.split("_", 2)[2]
+        try:
+            prods = fetch_products_by_category(cat, page_size=5, ship_to="IL")
+            rows = [normalize_ae_product(p) for p in prods]
+            append_to_pending(rows)
+            with FILE_LOCK:
+                pending_count = len(read_products(PENDING_CSV))
+            bot.answer_callback_query(c.id, f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}", show_alert=True)
+            safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                              new_text="✅ השאיבה הושלמה. חזור לתפריט הראשי:",
+                              reply_markup=inline_menu(), cb_id=c.id)
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בשאיבה: {e}", show_alert=True)
+        return
+
+    if data == "bot_toggle":
+        now_locked = toggle_bot_lock()
+        state = "🔴 כבוי" if now_locked else "🟢 פעיל"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"מצב הבוט כעת: {state}", reply_markup=inline_menu(), cb_id=c.id)
+        return
     chat_id = c.message.chat.id
 
     if data == "publish_now":
+        if is_bot_locked():
+            bot.answer_callback_query(c.id, "הבוט כבוי כרגע.", show_alert=True)
+            return
         ok = send_next_locked("manual")
         if not ok:
             bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
@@ -1226,7 +1306,11 @@ def auto_post_loop():
     init_pending()
 
     while True:
-        if read_auto_flag() != "on":
+        if is_bot_locked():
+            print(f"[{}] הבוט כבוי – שינה 5 שניות".format(datetime.now(tz=IL_TZ)), flush=True)
+            DELAY_EVENT.wait(timeout=5)
+            DELAY_EVENT.clear()
+            continueif read_auto_flag() != "on":
             print(f"[{datetime.now(tz=IL_TZ)}] מצב ידני – שינה 5 שניות", flush=True)
             DELAY_EVENT.wait(timeout=5)
             DELAY_EVENT.clear()
@@ -1339,216 +1423,3 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
-
-
-# ==============================
-# פונקציה לספירת מוצרים בתור
-def count_pending_queue():
-    queue_path = os.path.join(BASE_DIR, "queue.csv")
-    if not os.path.exists(queue_path):
-        return 0
-    with open(queue_path, "r", encoding="utf-8-sig") as f:
-        return sum(1 for line in f) - 1  # ללא שורת כותרת
-
-
-# ==============================
-# פעולה לשאיבת מוצרים לפי קטגוריה
-def handle_category_fetch(message, category_id, name):
-    if is_bot_locked():
-        bot.reply_to(message, "⚠️ הבוט כבוי כרגע. הפעל אותו תחילה.")
-        return
-    try:
-        added = fetch_products_by_category(category_id)
-        count = count_pending_queue()
-        message_text = f"✅ נוספו {added} מוצרים לקטגוריה {name}.\nכעת יש בתור: {count} פריטים."
-        bot.reply_to(message, message_text)
-    except Exception as e:
-        bot.reply_to(message, f"שגיאה בשאיבה: {e}")
-
-
-# ==============================
-# תפריט כפתורים ראשי
-@bot.message_handler(commands=["start", "menu"])
-def show_main_menu(message):
-    if is_bot_locked():
-        status = "🔴 כבוי"
-    else:
-        status = "🟢 פעיל"
-
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("🔁 שאיבת מוצרים", "📦 מצב תור")
-    markup.add("🛑 הפעל/כבה את הבוט", f"⚙️ מצב נוכחי: {status}")
-    bot.send_message(message.chat.id, "בחר פעולה מהתפריט:", reply_markup=markup)
-
-
-# ==============================
-# תפריט קטגוריות לשאיבה
-@bot.message_handler(func=lambda m: m.text == "🔁 שאיבת מוצרים")
-def show_fetch_categories(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(
-        types.InlineKeyboardButton("🪔 תאורה", callback_data="fetch_cat_100003109"),
-        types.InlineKeyboardButton("🧸 ילדים", callback_data="fetch_cat_1501"),
-        types.InlineKeyboardButton("💻 גאדג'טים", callback_data="fetch_cat_5090301"),
-        types.InlineKeyboardButton("👕 בגדים", callback_data="fetch_cat_200003482"),
-        types.InlineKeyboardButton("🛠 כלי עבודה", callback_data="fetch_cat_3227")
-    )
-    bot.send_message(message.chat.id, "בחר קטגוריה לשאיבה:", reply_markup=markup)
-
-
-# ==============================
-# הפעלת כיבוי/הפעלה
-@bot.message_handler(func=lambda m: m.text == "🛑 הפעל/כבה את הבוט")
-def toggle_lock(message):
-    now_locked = toggle_bot_lock()
-    status = "🔴 הבוט כעת כבוי." if now_locked else "🟢 הבוט כעת פעיל!"
-    bot.send_message(message.chat.id, status)
-
-
-# ==============================
-# מצב תור
-@bot.message_handler(func=lambda m: m.text == "📦 מצב תור")
-def queue_status(message):
-    count = count_pending_queue()
-    bot.send_message(message.chat.id, f"📦 כמות פריטים ממתינים בתור: {count}")
-
-
-# ==============================
-# לחיצות אינליין של קטגוריות
-@bot.callback_query_handler(func=lambda call: call.data.startswith("fetch_cat_"))
-def handle_fetch_callback(call):
-    if is_bot_locked():
-        bot.answer_callback_query(call.id, "הבוט כבוי כרגע")
-        return
-    category_id = call.data.replace("fetch_cat_", "")
-    name_map = {
-        "100003109": "תאורה",
-        "1501": "ילדים",
-        "5090301": "גאדג'טים",
-        "200003482": "בגדים",
-        "3227": "כלי עבודה"
-    }
-    name = name_map.get(category_id, "מוצרים")
-    handle_category_fetch(call.message, category_id, name)
-
-
-# ==============================
-# שאיבה אוטומטית כל 6 שעות
-AUTO_FETCH_FLAG = os.path.join(BASE_DIR, "auto_fetch.flag")
-CATEGORIES = [
-    ("100003109", "תאורה"),
-    ("1501", "ילדים"),
-    ("5090301", "גאדג'טים"),
-    ("200003482", "בגדים"),
-    ("3227", "כלי עבודה")
-]
-
-def is_auto_fetch_enabled():
-    return os.path.exists(AUTO_FETCH_FLAG)
-
-def toggle_auto_fetch():
-    if is_auto_fetch_enabled():
-        os.remove(AUTO_FETCH_FLAG)
-        return False
-    else:
-        with open(AUTO_FETCH_FLAG, "w") as f:
-            f.write("on")
-        return True
-
-def auto_fetch_loop():
-    while True:
-        if is_auto_fetch_enabled() and not is_bot_locked():
-            cat_id, name = random.choice(CATEGORIES)
-            try:
-                added = fetch_products_by_category(cat_id)
-                print(f"[AUTO] נוספו {added} מוצרים ({name}) לתור")
-            except Exception as e:
-                print(f"[AUTO] שגיאה בשאיבה: {e}")
-        time.sleep(6 * 60 * 60)  # כל 6 שעות
-
-auto_thread = threading.Thread(target=auto_fetch_loop, daemon=True)
-auto_thread.start()
-
-
-# ==============================
-# מחיקת פריט מהתור אחרי פרסום
-def remove_first_from_queue_and_archive():
-    queue_file = os.path.join(BASE_DIR, "queue.csv")
-    archive_file = os.path.join(BASE_DIR, "archive.csv")
-    if not os.path.exists(queue_file):
-        return
-
-    with open(queue_file, "r", encoding="utf-8-sig") as f:
-        lines = f.readlines()
-    if len(lines) <= 1:
-        return
-
-    first = lines[1]
-    with open(archive_file, "a", encoding="utf-8-sig") as a:
-        a.write(first)
-
-    with open(queue_file, "w", encoding="utf-8-sig") as f:
-        f.writelines([lines[0]] + lines[2:])  # שומר כותרת, מדלג על הראשון
-
-
-# ==============================
-# תפריט הפעלת שאיבה אוטומטית
-@bot.message_handler(func=lambda m: m.text == "⚙️ מצב נוכחי: 🟢 פעיל" or m.text == "⚙️ מצב נוכחי: 🔴 כבוי")
-def toggle_auto_fetch_button(message):
-    now_enabled = toggle_auto_fetch()
-    status = "🟢 מופעל" if now_enabled else "🔴 כבוי"
-    bot.send_message(message.chat.id, f"מצב שאיבה אוטומטית כעת: {status}")
-
-
-# ==============================
-# עיון בתור לפי עמודים
-from math import ceil
-
-PAGE_SIZE = 5
-queue_pages = {}
-
-@bot.message_handler(func=lambda m: m.text == "📋 עיון בתור")
-def view_queue_start(message):
-    user_id = message.chat.id
-    queue_pages[user_id] = 0
-    send_queue_page(user_id, 0)
-
-def send_queue_page(user_id, page):
-    path = os.path.join(BASE_DIR, "queue.csv")
-    if not os.path.exists(path):
-        bot.send_message(user_id, "התור ריק.")
-        return
-
-    with open(path, "r", encoding="utf-8-sig") as f:
-        lines = f.readlines()[1:]
-
-    total = len(lines)
-    if total == 0:
-        bot.send_message(user_id, "אין פריטים בתור.")
-        return
-
-    pages = ceil(total / PAGE_SIZE)
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    chunk = lines[start:end]
-
-    text = f"📋 עמוד {page+1}/{pages}\n\n"
-    for i, line in enumerate(chunk):
-        parts = line.split(",")
-        if len(parts) >= 2:
-            text += f"{start+i+1}. {parts[1]}\n"
-
-    nav = types.InlineKeyboardMarkup()
-    btns = []
-    if page > 0:
-        btns.append(types.InlineKeyboardButton("⏮ הקודם", callback_data=f"qprev_{page-1}"))
-    if end < total:
-        btns.append(types.InlineKeyboardButton("⏭ הבא", callback_data=f"qnext_{page+1}"))
-    nav.row(*btns)
-    bot.send_message(user_id, text, reply_markup=nav)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("qprev_") or call.data.startswith("qnext_"))
-def navigate_queue(call):
-    new_page = int(call.data.split("_")[1])
-    queue_pages[call.message.chat.id] = new_page
-    send_queue_page(call.message.chat.id, new_page)
