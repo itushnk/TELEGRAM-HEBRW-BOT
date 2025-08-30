@@ -1,3 +1,19 @@
+
+
+# --- Single instance lock to avoid 409 conflicts ---
+RUN_LOCK_PATH = os.path.join(BASE_DIR, "instance.lock")
+try:
+    # Try to acquire exclusive lock by creating the file only if it doesn't exist
+    fd = os.open(RUN_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(f"pid={os.getpid()}\n")
+    print(f"[INIT] Acquired instance lock at {RUN_LOCK_PATH}", flush=True)
+except FileExistsError:
+    print(f"[INIT] Another instance appears to be running (found {RUN_LOCK_PATH}). Exiting to avoid 409.", flush=True)
+    import sys; sys.exit(0)
+except Exception as e:
+    print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
+
 # -*- coding: utf-8 -*-
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -69,6 +85,19 @@ if not BOT_TOKEN:
     print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+try:
+    # Ensure webhook is disabled and drop any backlog to reduce 409 noise
+    bot.delete_webhook(drop_pending_updates=True)
+except TypeError:
+    # Older pyTelegramBotAPI may not support this kwarg; fallback
+    try:
+        bot.delete_webhook()
+    except Exception:
+        pass
+except Exception:
+    pass
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
 IL_TZ = ZoneInfo("Asia/Jerusalem")
@@ -683,6 +712,14 @@ def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
 
 
 # ========= INLINE MENU =========
+@bot.message_handler(commands=['start','menu'])
+def _show_menu(message):
+    try:
+        bot.send_message(message.chat.id, "תפריט ראשי:", reply_markup=inline_menu())
+    except Exception as e:
+        print(f"[WARN] failed to send menu: {e}", flush=True)
+
+
 def inline_menu():
     kb = types.InlineKeyboardMarkup(row_width=3)
 
