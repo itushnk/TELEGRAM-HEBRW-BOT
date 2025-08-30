@@ -847,8 +847,16 @@ def on_inline_click(c):
                               new_text="✅ השאיבה הושלמה. חזור לתפריט הראשי:",
                               reply_markup=inline_menu(), cb_id=c.id)
         except Exception as e:
-            bot.answer_callback_query(c.id, f"שגיאה בשאיבה: {e}", show_alert=True)
+            msg = str(e)
+            print(f"[AE][ERR] {msg}", flush=True)
+            try:
+                bot.answer_callback_query(c.id, f"שגיאה בשאיבה: {msg[:180]}", show_alert=True)
+            except Exception:
+                pass
         return
+
+
+
 
     if data == "bot_toggle":
         now_locked = toggle_bot_lock()
