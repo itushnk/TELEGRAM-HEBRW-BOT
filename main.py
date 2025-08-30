@@ -756,15 +756,17 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
-    if is_bot_locked() and (c.data or '') != 'bot_toggle':
+    try:
+        data = c.data or ""
+    except Exception:
+        data = ""
+    try:
+        chat_id = c.message.chat.id if getattr(c, 'message', None) else c.from_user.id
+    except Exception:
+        chat_id = None
+    if is_bot_locked() and data != 'bot_toggle':
         bot.answer_callback_query(c.id, 'הבוט כבוי כרגע.', show_alert=True)
         return
-    global POST_DELAY_SECONDS, CURRENT_TARGET
-    if not _is_admin(c.message):
-        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
-        return
-
-    data = c.data or ""
 
     if data == "ae_menu":
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -1043,6 +1045,7 @@ def on_inline_click(c):
     func=lambda m: EXPECTING_TARGET.get(getattr(m.from_user, "id", None)) is not None,
     content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice']
 )
+
 def handle_forward_for_target(msg):
     mode = EXPECTING_TARGET.get(getattr(msg.from_user, "id", None))
     fwd = getattr(msg, "forward_from_chat", None)
