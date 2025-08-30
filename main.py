@@ -1,1535 +1,1554 @@
 # -*- coding: utf-8 -*-
-"""
-main.py — גרסה יציבה ומלאה:
-- AliExpress Affiliate Client אמיתי (HMAC-SHA256, /sync)
-- מניעת ריבוי אינסטנסים (409) ע"י נעילת socket
-- בדיקת טוקן (401) ועצירה נקייה
-- תור CSV עם ניהול בסיסי (עיון/מחיקה) + processed.csv
-- תפריט /start עם כפתורים: פרסם עכשיו, מצב תור, שינוי דיליי, מצב אוטומטי, טען מחדש, בדיקת AliExpress, ניהול תור, משיכת מוצרים
-- לולאת שידור אוטומטי אחידה עם דיליי, "שעות שקטות" אופציונליות
-- נרמול טקסט ואימוג'ים (NFC) לכל הפלט
-"""
-
-
-import os, sys, csv, json, time, socket, threading, unicodedata, hmac, hashlib
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import Dict, Any, Optional, List
-import datetime as dt
-import requests
-import json
-import time
-# safe fcntl import
-try:
-    import fcntl  # POSIX only
-except Exception:
-    fcntl = None  # fallback for non-POSIX or missing module
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
-# ---- Single-instance lock path (always defined, after BOT_TOKEN & imports) ----
-_tok_for_lock = BOT_TOKEN if 'BOT_TOKEN' in globals() else os.getenv("BOT_TOKEN", "")
-try:
-    RUN_LOCK_PATH = os.getenv("RUN_LOCK_PATH") or f"/tmp/tg-bot-{hashlib.sha1((_tok_for_lock or '').encode('utf-8')).hexdigest()[:8]}.lock"
-except Exception:
-    RUN_LOCK_PATH = os.getenv("RUN_LOCK_PATH") or "/tmp/tg-bot.lock"
-
-# ========= פלט מיידי ללוגים =========
+import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
     pass
 
-# ========= תלותי טלגרם =========
+import csv
+import requests
+import time
 import telebot
 from telebot import types
+import threading
+from datetime import datetime, timedelta, time as dtime
+from zoneinfo import ZoneInfo
+import socket
+import re
 
-# ========= קונפיג/נתיבים =========
+# ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
-
-# ========= Persistent Config (channel & admin) =========
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json") if "BASE_DIR" in globals() else os.path.join(os.getcwd(), "config.json")
-
-def _cfg_load() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _cfg_save(cfg: dict) -> None:
-    try:
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, CONFIG_PATH)
-    except Exception as e:
-        print(f"[{now_str()}] Failed saving config: {e}", flush=True)
-
-GLOBAL_CONFIG = _cfg_load()
-
-def is_admin(user_id: int) -> bool:
-    try:
-        env_admin = os.getenv("ADMIN_USER_ID", "").strip()
-        if env_admin:
-            try:
-                if int(env_admin) == int(user_id):
-                    return True
-            except Exception:
-                pass
-        owner = GLOBAL_CONFIG.get("admin_user_id")
-        if owner is not None:
-            return int(owner) == int(user_id)
-        # If not set, allow first setter to become admin
-        return True
-    except Exception:
-        return False
-
-def ensure_admin(user_id: int):
-    # Set first admin if not set
-    if GLOBAL_CONFIG.get("admin_user_id") is None:
-        GLOBAL_CONFIG["admin_user_id"] = int(user_id)
-        _cfg_save(GLOBAL_CONFIG)
-
-def set_channel_binding(kind: str, value: str, setter_id: int):
-    # kind: "public" or "private"
-    GLOBAL_CONFIG["channel_type"] = "public" if kind == "public" else "private"
-    GLOBAL_CONFIG["channel_id"] = str(value)
-    ensure_admin(setter_id)
-    _cfg_save(GLOBAL_CONFIG)
-
-def get_current_channel_id():
-    # preference: config file → env → empty
-    cid = (GLOBAL_CONFIG.get("channel_id") or os.getenv("CHANNEL_ID", "")).strip()
-    return cid
-
-def parse_chat_id(cid: str):
-    cid = str(cid).strip()
-    if not cid:
-        return cid
-    if cid.startswith("@"):
-        return cid  # public channel username
-    # numeric id (private/public)
-    try:
-        return int(cid)
-    except Exception:
-        return cid
-EMPTY_QUEUE_SLEEP = int(os.getenv("EMPTY_QUEUE_SLEEP", "300"))  # seconds to wait when queue is empty
 os.makedirs(BASE_DIR, exist_ok=True)
 
-QUEUE_CSV     = os.path.join(BASE_DIR, "queue.csv")       # תור מוצרים לפרסום
-PROCESSED_CSV = os.path.join(BASE_DIR, "processed.csv")   # מה שפורסם
-STATE_JSON    = os.path.join(BASE_DIR, "state.json")      # index/delay/auto
-LOCK_FILE     = os.path.join(BASE_DIR, "bot.lock")        # קובץ נעילה
-AUTO_FLAG_FILE= os.path.join(BASE_DIR, "auto_mode.flag")  # on/off
-KEYWORDS_TXT  = os.path.join(BASE_DIR, "keywords.txt")
-AE_LAST_REQ_JSON = os.path.join(BASE_DIR, "ae_last_request.json")
-AE_LAST_RES_JSON = os.path.join(BASE_DIR, "ae_last_response.json")
-UPLOADS_DIR   = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOADS_DIR, exist_ok=True)
+# ========= CONFIG =========
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
+ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
-REQUIRED_UPLOAD_COLUMNS = [
-    "ProductId","Image Url","Video Url","Product Desc","Origin Price","Discount Price","Discount","Currency",
-    "Direct linking commission rate (%)","Estimated direct linking commission","Indirect linking commission rate (%)",
-    "Estimated indirect linking commission","Sales180Day","Positive Feedback","Promotion Url","Code Name","Code Start Time",
-    "Code End Time","Code Value","Code Quantity","Code Minimum Spend"
-]
-    # מילות חיפוש לאוטו-פצ'ר (אופציונלי)
+# קבצים (בתיקיית DATA המתמשכת או לוקאלית)
+DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
+PENDING_CSV = os.path.join(BASE_DIR, "pending.csv")      # תור הפוסטים
+DELAY_FILE = os.path.join(BASE_DIR, "post_delay.txt")    # מרווח שידור
+PUBLIC_PRESET_FILE  = os.path.join(BASE_DIR, "public_target.preset")
+PRIVATE_PRESET_FILE = os.path.join(BASE_DIR, "private_target.preset")
 
-TZ = ZoneInfo("Asia/Jerusalem")
+# דגלים
+SCHEDULE_FLAG_FILE = os.path.join(BASE_DIR, "schedule_enforced.flag")
+CONVERT_NEXT_FLAG_FILE = os.path.join(BASE_DIR, "convert_next_usd_to_ils.flag")
 
-# ========= משתני סביבה =========
-BOT_TOKEN   = (os.environ.get("BOT_TOKEN") or "").strip()
-CHANNEL_ID  = (os.environ.get("CHANNEL_ID") or "").strip()   # "@yourchannel" או chat_id מספרי
-JOIN_LINK   = (os.environ.get("JOIN_LINK") or "").strip()
-DEFAULT_DELAY_SEC = int(os.environ.get("POST_DELAY_SECONDS", "1200"))  # ברירת מחדל 20 דקות
 
-# Quiet hours (לא חובה): פורמט "HH:MM"
-QUIET_START = (os.environ.get("QUIET_START_HHMM") or "").strip()  # למשל "23:00"
-QUIET_END   = (os.environ.get("QUIET_END_HHMM") or "").strip()    # למשל "07:00"
-QUIET_WEEKEND = (os.environ.get("QUIET_WEEKEND", "false").lower() in ("1","true","yes","on"))
+from aliexpress import fetch_products_by_category
 
-# AliExpress env
-AE_APP_KEY    = (os.environ.get("AE_APP_KEY") or "").strip()
-AE_APP_SECRET = (os.environ.get("AE_APP_SECRET") or "").strip()
-AE_TRACKING_ID= (os.environ.get("AE_TRACKING_ID") or "").strip()
-AE_TARGET_LANGUAGE = (os.environ.get("AE_TARGET_LANGUAGE") or "HE").strip()
-AE_TARGET_CURRENCY = (os.environ.get("AE_TARGET_CURRENCY") or "ILS").strip()
-AE_SHIP_TO_COUNTRY = (os.environ.get("AE_SHIP_TO_COUNTRY") or "IL").strip()
+# קובץ נעילה להפעלת/כיבוי הבוט כולו
+BOT_LOCK_FILE = os.path.join(BASE_DIR, "bot.lock")
 
-# ========= בדיקת טוקן =========
+def is_bot_locked():
+    return os.path.exists(BOT_LOCK_FILE)
+
+def toggle_bot_lock():
+    if is_bot_locked():
+        os.remove(BOT_LOCK_FILE)
+        return False
+    else:
+        with open(BOT_LOCK_FILE, "w") as f:
+            f.write("locked")
+        return True
+
+def count_pending_queue():
+    path = os.path.join(BASE_DIR, "queue.csv")
+    if not os.path.exists(path):
+        return 0
+    with open(path, encoding="utf-8-sig") as f:
+        return sum(1 for line in f) - 1  # header
+
+
+# שער ברירת מחדל
+USD_TO_ILS_RATE_DEFAULT = 3.55
+
+# נעילה למופע יחיד
+LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
+
+# ========= INIT =========
 if not BOT_TOKEN:
-    print("FATAL: חסר BOT_TOKEN בסביבת ההרצה. עצירה.", flush=True)
-    sys.exit(1)
+    print("[WARN] BOT_TOKEN חסר – הבוט ירוץ אבל לא יוכל להתחבר לטלגרם עד שתקבע ENV.", flush=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "TelegramPostBot/1.0"})
+IL_TZ = ZoneInfo("Asia/Jerusalem")
 
-# ========= מניעת ריבוי אינסטנסים (409) =========
-try:
-    _lock_fp = open(LOCK_FILE, "w")
-    _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _lock_socket.bind(("127.0.0.1", 58765))  # אם תפוס, תהליך אחר כבר רץ
-    _lock_socket.listen(1)
-except OSError:
-    print("Another instance is already running (port lock busy). Exiting to avoid 409.", flush=True)
-    sys.exit(0)
-except Exception as e:
-    print(f"WARNING: lock init issue: {e}", flush=True)
+# יעד נוכחי
+CURRENT_TARGET = CHANNEL_ID
 
-# ========= כלי עזר =========
-FILE_LOCK = threading.RLock()
+# “התעוררות חמה” ללולאת השידור
 DELAY_EVENT = threading.Event()
 
-def nfc(s: str) -> str:
-    return unicodedata.normalize("NFC", s or "")
+# מצב בחירת יעד (באמצעות Forward)
+EXPECTING_TARGET = {}  # dict[user_id] = "public"|"private"
 
-def now_str() -> str:
-    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+# מצב העלאת CSV
+EXPECTING_UPLOAD = set()  # user_ids שמצפים ל-CSV
 
-def read_state() -> Dict[str, Any]:
-    st = {"index": 0, "auto": True, "delay": DEFAULT_DELAY_SEC}
-    if os.path.exists(STATE_JSON):
-        try:
-            with open(STATE_JSON, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            st.update({k: data.get(k, st[k]) for k in st.keys()})
-        except Exception as e:
-            print(f"[{now_str()}] read_state error: {e}", flush=True)
-    return st
+# נעילה לפעולות על התור כדי למנוע כפילות בין הלולאה לכפתור ידני
+FILE_LOCK = threading.Lock()
 
-def write_state(st: Dict[str, Any]) -> None:
+
+# ========= SINGLE INSTANCE LOCK =========
+def acquire_single_instance_lock(lock_path: str):
     try:
-        with open(STATE_JSON, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False, indent=2)
+        if os.name == "nt":
+            import msvcrt
+            f = open(lock_path, "w")
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("Another instance is running. Exiting.", flush=True)
+                sys.exit(1)
+            return f
+        else:
+            import fcntl
+            f = open(lock_path, "w")
+            try:
+                fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                print("Another instance is running. Exiting.", flush=True)
+                sys.exit(1)
+            return f
     except Exception as e:
-        print(f"[{now_str()}] write_state error: {e}", flush=True)
+        print(f"[WARN] Could not acquire single-instance lock: {e}", flush=True)
+        return None
 
-def read_auto_flag() -> str:
+
+# ========= WEBHOOK DIAGNOSTICS =========
+def print_webhook_info():
     try:
-        with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
-            v = (f.read() or "").strip().lower()
-            return "on" if v == "on" else "off"
-    except FileNotFoundError:
-        return "on"
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getWebhookInfo"
+        r = requests.get(url, timeout=10)
+        print("getWebhookInfo:", r.json(), flush=True)
+    except Exception as e:
+        print(f"[WARN] getWebhookInfo failed: {e}", flush=True)
 
-def write_auto_flag(value: str) -> None:
-    with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
-        f.write("on" if str(value).lower() == "on" else "off")
-
-def parse_hhmm(s: str) -> Optional[int]:
+def force_delete_webhook():
     try:
-        hh, mm = s.split(":")
-        return int(hh) * 60 + int(mm)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook"
+        r = requests.get(url, params={"drop_pending_updates": True}, timeout=10)
+        print("deleteWebhook:", r.json(), flush=True)
+    except Exception as e:
+        print(f"[WARN] deleteWebhook failed: {e}", flush=True)
+
+
+# ========= HELPERS =========
+def safe_int(value, default=0):
+    try:
+        if value is None or str(value).strip() == "":
+            return default
+        return int(float(str(value).strip()))
     except Exception:
-        return None
+        return default
 
-def is_weekend(today: datetime) -> bool:
-    # יום שישי=4, שבת=5 (Python weekday: Monday=0)
-    return today.weekday() in (4, 5)
+def norm_percent(value, decimals=1, empty_fallback=""):
+    s = str(value).strip() if value is not None else ""
+    if not s:
+        return empty_fallback
+    s = s.replace("%", "")
+    try:
+        f = float(s)
+        return f"{round(f, decimals)}%"
+    except Exception:
+        return empty_fallback
 
-def is_quiet_now() -> bool:
-    now = datetime.now(TZ)
-    if QUIET_WEEKEND and is_weekend(now):
-        return True
-    start_m = parse_hhmm(QUIET_START) if QUIET_START else None
-    end_m   = parse_hhmm(QUIET_END) if QUIET_END else None
-    if start_m is None or end_m is None:
-        return False
-    cur_m = now.hour * 60 + now.minute
-    if start_m <= end_m:
-        return start_m <= cur_m < end_m
-    else:
-        # טווח שחוצה חצות
-        return cur_m >= start_m or cur_m < end_m
+def clean_price_text(s):
+    if s is None:
+        return ""
+    s = str(s)
+    for junk in ["ILS", "₪"]:
+        s = s.replace(junk, "")
+    out = "".join(ch for ch in s if ch.isdigit() or ch == ".")
+    return out.strip()
 
-def get_auto_delay() -> Optional[int]:
-    # אם שעות שקטות — None; אחרת דיליי נוכחי
-    if is_quiet_now():
-        return None
-    st = read_state()
-    return max(60, int(st.get("delay", DEFAULT_DELAY_SEC)))
-
-def read_csv_rows(path: str) -> List[Dict[str, Any]]:
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        return list(reader)
-
-def write_csv_rows(path: str, rows: List[Dict[str, Any]], fieldnames: Optional[List[str]] = None) -> None:
-    if not rows and not fieldnames:
-        # ריק לגמרי — נמחוק את הקובץ אם קיים
+def normalize_row_keys(row):
+    out = dict(row)
+    if "ImageURL" not in out:
+        out["ImageURL"] = out.get("Image Url", "") or out.get("ImageURL", "")
+    if "Video Url" not in out:
+        out["Video Url"] = out.get("Video Url", "")
+    if "BuyLink" not in out:
+        out["BuyLink"] = out.get("Promotion Url", "") or out.get("BuyLink", "")
+    out["OriginalPrice"] = clean_price_text(out.get("OriginalPrice", "") or out.get("Origin Price", ""))
+    out["SalePrice"]     = clean_price_text(out.get("SalePrice", "") or out.get("Discount Price", ""))
+    disc = f"{out.get('Discount', '')}".strip()
+    if disc and not disc.endswith("%"):
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            disc = f"{int(round(float(disc)))}%"
         except Exception:
             pass
+    out["Discount"] = disc
+    out["Rating"] = norm_percent(out.get("Rating", "") or out.get("Positive Feedback", ""), decimals=1, empty_fallback="")
+    if not str(out.get("Orders", "")).strip():
+        out["Orders"] = str(out.get("Sales180Day", "")).strip()
+    if "CouponCode" not in out:
+        out["CouponCode"] = out.get("Code Name", "") or out.get("CouponCode", "")
+    if "ItemId" not in out:
+        out["ItemId"] = out.get("ProductId", "") or out.get("ItemId", "") or "ללא מספר"
+    if "Opening" not in out:
+        out["Opening"] = out.get("Opening", "") or ""
+    if "Title" not in out:
+        out["Title"] = out.get("Title", "") or out.get("Product Desc", "") or ""
+    out["Strengths"] = out.get("Strengths", "")
+    # --- SAFE fallback fills for text fields ---
+    out["Opening"]   = (out.get("Opening") or "").strip()
+    out["Title"]     = (out.get("Title") or out.get("Product Desc") or "").strip()
+    out["Strengths"] = (out.get("Strengths") or "").strip()
+    out["Product Desc"] = (out.get("Product Desc") or "").strip()
+    return out
+
+def read_products(path):
+    if not os.path.exists(path):
+        return []
+    with open(path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        rows = [normalize_row_keys(r) for r in reader]
+        return rows
+
+def write_products(path, rows):
+    base_headers = [
+        "ItemId","ImageURL","Title","OriginalPrice","SalePrice","Discount",
+        "Rating","Orders","BuyLink","CouponCode","Opening","Video Url","Strengths"
+    ]
+    if not rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=base_headers)
+            w.writeheader()
         return
-    if fieldnames is None:
-        if rows:
-            # איחוד מפתחות לשימור שדות
-            keys = set()
-            for r in rows:
-                keys.update(r.keys())
-            fieldnames = list(keys)
-        else:
-            fieldnames = ["ProductId","Image Url","Product Desc","Opening","Title","Strengths","Promotion Url"]
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+    headers = list(dict.fromkeys(base_headers + [k for r in rows for k in r.keys()]))
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
         w.writeheader()
         for r in rows:
             w.writerow(r)
 
-def read_queue() -> List[Dict[str, Any]]:
-    with FILE_LOCK:
-        return read_csv_rows(QUEUE_CSV)
+def init_pending():
+    if not os.path.exists(PENDING_CSV):
+        src = read_products(DATA_CSV)
+        write_products(PENDING_CSV, src)
 
-def append_processed(row: Dict[str, Any]) -> None:
-    with FILE_LOCK:
-        exists = os.path.exists(PROCESSED_CSV)
-        # שומר את כל השדות שקיימים בשורה
-        fieldnames = list(row.keys())
-        with open(PROCESSED_CSV, "a", encoding="utf-8-sig", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            if not exists:
-                w.writeheader()
-            w.writerow(row)
-
-def append_to_queue(rows: List[Dict[str, Any]]) -> int:
-    with FILE_LOCK:
-        existing = read_queue()
-        # Union of keys between existing and new rows
-        keys = set()
-        for r in existing:
-            keys.update(r.keys())
-        for r in rows:
-            keys.update(r.keys())
-        fieldnames = list(keys) if keys else ["ProductId","Image Url","Product Desc","Opening","Title","Strengths","Promotion Url"]
-        all_rows = existing + rows
-        write_csv_rows(QUEUE_CSV, all_rows, fieldnames=fieldnames)
-        return len(rows)
-
-# ========= AliExpress Affiliate Client =========
-SESSION = None
-try:
-    import requests
-    SESSION = requests.Session()
-except Exception:
-    SESSION = None
-    pass  # נשתמש ב-requests כשיהיה זמין
-
-API_ENDPOINTS = ["https://api-sg.aliexpress.com/sync", "https://api-sg.aliexpress.com/rest", "https://api.aliexpress.com/sync"]
-
-# Ensure requests session has a UA to avoid anti-bot filters
-if SESSION is not None:
+# ---- PRESET HELPERS ----
+def _save_preset(path: str, value):
     try:
-        SESSION.headers.update({"User-Agent": "Mozilla/5.0 (compatible; AE-Bot/1.0)", "Accept": "application/json"})
-    except Exception:
-        pass
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(value))
+    except Exception as e:
+        print(f"[WARN] Failed to save preset {path}: {e}", flush=True)
 
-class AliExpressAffiliateClient:
-    """
-    לקוח אפיליאייטים עם נסיונות endpoint/חתימה/טיימסטמפ וגם פרמטרים חלופיים (trackingId/tracking_id, pageNo/page_no וכו').
-    כותב את הקריאה/תשובה האחרונות לקבצים: ae_last_request.json / ae_last_response.json
-    """
-    _METHODS = ["aliexpress.affiliate.product.query", "aliexpress.affiliate.product.search"]
-    _ENDPOINTS = API_ENDPOINTS
-
-    def __init__(self, app_key: Optional[str] = None, app_secret: Optional[str] = None, tracking_id: Optional[str] = None):
-        self.app_key = (app_key or AE_APP_KEY)
-        self.app_secret = (app_secret or AE_APP_SECRET)
-        self.tracking_id = (tracking_id or AE_TRACKING_ID)
-        self.lang = AE_TARGET_LANGUAGE
-        self.currency = AE_TARGET_CURRENCY
-        self.ship_to = AE_SHIP_TO_COUNTRY
-        if not (self.app_key and self.app_secret and self.tracking_id):
-            print("[WARN] AliExpress keys missing; set AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID", flush=True)
-
-    def _ensure_ready(self):
-        if not (self.app_key and self.app_secret and self.tracking_id):
-            raise RuntimeError("Missing AE_APP_KEY / AE_APP_SECRET / AE_TRACKING_ID")
-
-    def _sign_hmac_sha256(self, params: Dict[str, Any]) -> str:
-        base = "&".join(f"{k}={params[k]}" for k in sorted(params))
-        import hmac, hashlib
-        return hmac.new(self.app_secret.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest().upper()
-
-    def _sign_md5(self, params: Dict[str, Any]) -> str:
-        base = "".join(f"{k}{params[k]}" for k in sorted(params))
-        import hashlib
-        return hashlib.md5((self.app_secret + base + self.app_secret).encode("utf-8")).hexdigest().upper()
-
-    def _http(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        if SESSION is None:
-            raise RuntimeError("requests not available in this environment.")
-        # write request snapshot
-        try:
-            with open(AE_LAST_REQ_JSON, "w", encoding="utf-8") as f:
-                json.dump({"endpoint": endpoint, "params": params}, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        r = SESSION.get(endpoint, params=params, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        # write response snapshot
-        try:
-            with open(AE_LAST_RES_JSON, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        return data
-
-    def _call_once(self, endpoint: str, method: str, biz_params: Dict[str, Any], sign_method: str, ts_mode: str) -> Dict[str, Any]:
-        frame = {
-            "app_key": self.app_key,
-            "method": method,
-            "format": "json",
-            "sign_method": "HmacSHA256" if sign_method.lower() == "hmac" else "md5",
-            "timestamp": (int(time.time()*1000) if ts_mode == "ms" else int(time.time())),
-            "v": "1.0",
-        }
-        merged = {**frame, **{k: v for k, v in biz_params.items() if v is not None}}
-        sign_params = {k: merged[k] for k in merged if k != "sign"}
-        merged["sign"] = (self._sign_hmac_sha256(sign_params) if sign_method.lower()=="hmac" else self._sign_md5(sign_params))
-        data = self._http(endpoint, merged)
-        if isinstance(data, dict):
-            data.setdefault("_debug", {})["endpoint"] = endpoint
-            data["_debug"]["sign_method_used"] = frame["sign_method"]
-            data["_debug"]["timestamp_mode"] = ts_mode
-            data["_debug"]["method"] = method
-        return data
-
-    def _call_permutations(self, base_params: Dict[str, Any]) -> Dict[str, Any]:
-        tries_sm_ts = [("hmac","ms"), ("hmac","s"), ("md5","s")]
-        # param permutations
-        param_variants = []
-        for track_key in ("trackingId","tracking_id"):
-            for page_no in ("pageNo","page_no"):
-                for page_sz in ("pageSize","page_size"):
-                    for ship_key in ("ship_to","shipTo","ship_to_country"):
-                        p = dict(base_params)
-                        p[track_key] = base_params.get("trackingId") or base_params.get("tracking_id")
-                        p[page_no] = base_params.get("pageNo") or base_params.get("page_no") or 1
-                        p[page_sz] = base_params.get("pageSize") or base_params.get("page_size") or 10
-                        p[ship_key] = base_params.get("ship_to") or base_params.get("ship_to_country") or self.ship_to
-                        # remove canonical keys to avoid duplicates inside the same dict
-                        for k in ("trackingId","tracking_id","pageNo","page_no","pageSize","page_size","ship_to","ship_to_country","shipTo"):
-                            if k not in (track_key, page_no, page_sz, ship_key) and k in p:
-                                del p[k]
-                        param_variants.append(p)
-
-        last_data = None
-        for ep in self._ENDPOINTS:
-            for method in self._METHODS:
-                for pv in param_variants:
-                    for sign_m, ts_m in tries_sm_ts:
-                        try:
-                            data = self._call_once(ep, method, pv, sign_m, ts_m)
-                            dstr = json.dumps(data, ensure_ascii=False)[:600].lower()
-                            if any(x in dstr for x in ["signature", "sign", "invalid", "does not conform", "auth", "permission denied"]):
-                                last_data = data
-                                continue
-                            return data
-                        except Exception as e:
-                            last_data = {"error": str(e), "_debug": {"endpoint": ep, "method": method, "variant": pv}}
-                            continue
-        return last_data or {}
-
-    def _extract_items(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        def dig(d, path):
-            cur = d
-            for p in path:
-                if not isinstance(cur, dict):
-                    return None
-                cur = cur.get(p)
-            return cur
-        for path in [
-            ("resp_result", "result", "products"),
-            ("resp_result", "result", "items"),
-            ("result", "products"),
-            ("result", "items"),
-            ("items",),
-        ]:
-            v = dig(data, path)
-            if isinstance(v, list):
-                return v
-        return []
-
-    def search_products(self, keyword: str, page_size: int = 5) -> Dict[str, Any]:
-        self._ensure_ready()
-        base_params = {
-            "trackingId": self.tracking_id,
-            "keywords": keyword,
-            "pageNo": 1,
-            "pageSize": page_size,
-            "target_language": self.lang,
-            "target_currency": self.currency,
-            "ship_to": self.ship_to,
-        }
-        data = self._call_permutations(base_params)
-
-        # fallback to EN/USD
-        items = self._extract_items(data)
-        if not items:
-            data_fb = self._call_permutations({**base_params, "target_language": "EN", "target_currency": "USD"})
-            items = self._extract_items(data_fb)
-            if items:
-                data = data_fb
-
-        out = []
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            pid   = it.get("productId") or it.get("product_id") or it.get("target_id") or it.get("itemId")
-            title = it.get("product_title") or it.get("title") or it.get("subject") or it.get("name")
-            image = it.get("image") or it.get("image_url") or it.get("main_image") or it.get("imageUrl")
-            promo = it.get("promotion_link") or it.get("promotionUrl") or it.get("target_url")
-            if not promo and pid:
-                promo = f"https://www.aliexpress.com/item/{pid}.html"
-            out.append({"productId": pid, "title": title, "imageUrl": image, "promotionUrl": promo})
-
-        # surface errors
-        if not out and isinstance(data, dict):
-            for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
-                if k in data and data[k]:
-                    return {"items": [], "error": str(data[k]), "_debug": data.get("_debug", {})}
-            for k in ("resp_code","code","status"):
-                if k in data and str(data[k]) not in ("0","200","OK","ok"):
-                    return {"items": [], "error": f"code={data[k]}", "_debug": data.get("_debug", {})}
-        return {"items": out, "_debug": data.get("_debug", {}) if isinstance(data, dict) else {}}
-
-    def generate_promotion_link(self, item_id: str) -> Dict[str, Any]:
-        self._ensure_ready()
-        return {"promotion_url": f"https://www.aliexpress.com/item/{item_id}.html"}
-
-AE = AliExpressAffiliateClient()
-
-# ========= בניית פוסט =========
-def build_post(row: Dict[str, Any]) -> str:
-    opening = nfc((row.get("Opening") or "").strip() or "דיל חם נחת לערוץ! 🔥")
-    # Prefer Title else Product Desc
-    title_src = (row.get("Title") or row.get("Product Desc") or "").strip()
-    title = nfc(title_src[:140])
-    link    = (row.get("Promotion Url") or "").strip()
-    item_id = (row.get("ProductId") or "ללא מספר").strip()
-
-    # Strengths (optional free text)
-    strengths_field = nfc((row.get("Strengths") or "").strip())
-    strengths_lines: List[str] = []
-    if strengths_field:
-        for part in _re.split(r'[|\r\n]+', strengths_field):
-            p = nfc(part.strip())
-            if p:
-                strengths_lines.append(p)
-
-
-    # Enrich with price/coupon info from uploaded columns if present
-    currency = (row.get("Currency") or "").strip()
-    origin_price = (row.get("Origin Price") or "").strip()
-    discount_price = (row.get("Discount Price") or "").strip()
-    discount_pct = (row.get("Discount") or "").strip()
-    code_name = (row.get("Code Name") or "").strip()
-    code_val  = (row.get("Code Value") or "").strip()
-    code_min  = (row.get("Code Minimum Spend") or "").strip()
-    code_start= (row.get("Code Start Time") or "").strip()
-    code_end  = (row.get("Code End Time") or "").strip()
-
-    # Price line
-    price_lines = []
-    if discount_price and currency:
-        price_lines.append(f"💸 מחיר אחרי הנחה: {discount_price} {currency}")
-    if origin_price and currency:
-        price_lines.append(f"🟡 מחיר קודם: <s>{origin_price} {currency}</s>")
-    if discount_pct:
-        price_lines.append(f"🔻 הנחה: {discount_pct}")
-
-    # Coupon line
-    def parse_dt(s: str):
-        fmts = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"]
-        for fmt in fmts:
-            try:
-                return dt.datetime.strptime(s, fmt).replace(tzinfo=TZ)
-            except Exception:
-                pass
+def _load_preset(path: str):
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"[WARN] Failed to load preset {path}: {e}", flush=True)
         return None
 
-    coupon_lines = []
-    if code_val:
-        valid = ""
-        dt_start = parse_dt(code_start) if code_start else None
-        dt_end = parse_dt(code_end) if code_end else None
-        now = dt.datetime.now(TZ)
-        if dt_start and dt_end:
-            if dt_start <= now <= dt_end:
-                valid = f"(תקף עד {dt_end.strftime('%d.%m.%Y %H:%M')})"
-            elif now < dt_start:
-                valid = f"(יתחיל ב־{dt_start.strftime('%d.%m.%Y %H:%M')})"
-            else:
-                valid = "(פג תוקף)"
-        elif dt_end:
-            valid = f"(עד {dt_end.strftime('%d.%m.%Y %H:%M')})"
-        if code_min:
-            coupon_lines.append(f"🎟️ קופון: {code_val} {valid} | מינימום רכישה: {code_min}")
-        else:
-            coupon_lines.append(f"🎟️ קופון: {code_val} {valid}")
-
-    # Ensure at least 3 bullets
-    while len(strengths_lines) < 3:
-        if price_lines:
-            strengths_lines.append(price_lines.pop(0))
-        elif coupon_lines:
-            strengths_lines.append(coupon_lines.pop(0))
-        else:
-            strengths_lines.append("✨ יתרון בולט של המוצר")
-
-    purchase_line = f'<a href="{link}">להזמנה מהירה לחצו כאן👉</a>' if link else ""
-    join_line = f'<a href="{JOIN_LINK}">להצטרפות לערוץ לחצו עליי👉</a>' if JOIN_LINK else ""
-
-    parts = [opening, "", title, ""] + strengths_lines[:3] + [""]
-    # Append remaining price/coupon lines if any
-    parts += price_lines
-    parts += coupon_lines
-    if purchase_line:
-        parts.append(purchase_line)
-    parts.append(f"מספר פריט: {nfc(item_id)}")
-    if join_line:
-        parts.append(join_line)
-    return nfc("\n".join(parts))
-
-def try_post_row(row: Dict[str, Any]) -> bool:
-    msg = build_post(row)
+def resolve_target(value):
     try:
-        if not get_current_channel_id():
-            print("WARNING: חסר CHANNEL_ID/הגדרה בקובץ config (הגדר דרך ⚙️ הגדרות ערוץ או משתנה סביבה) — לא ניתן לשלוח לערוץ.", flush=True)
-            return False
-        bot.send_message(parse_chat_id(get_current_channel_id()), msg, disable_web_page_preview=False)
-        img = (row.get("Image Url") or "").strip()
-        if img:
-            bot.send_photo(parse_chat_id(get_current_channel_id()), img)
-        return True
-    except telebot.apihelper.ApiTelegramException as e:
-        print(f"[{now_str()}] Telegram API error: {e}", flush=True)
-        return False
-    except Exception as e:
-        print(f"[{now_str()}] post error: {e}", flush=True)
-        return False
-
-def post_next_from_queue() -> (bool, str):
-    st = read_state()
-    with FILE_LOCK:
-        q = read_queue()
-        if not q:
-            return False, "התור ריק בקובץ queue.csv"
-        idx = int(st.get("index", 0))
-        if idx >= len(q):
-            return False, "הגענו לסוף התור."
-        row = q[idx]
-        ok = try_post_row(row)
-        if ok:
-            append_processed(row)
-            st["index"] = idx + 1
-            write_state(st)
-            return True, f"פורסם פריט #{st['index']} מתוך {len(q)}"
-        else:
-            return False, "שליחה נכשלה (ראה לוג)."
-
-
-# ========= אבחון AliExpress =========
-@bot.message_handler(commands=["ae_diag"])
-def cmd_ae_diag(m: types.Message):
-    lines = []
-    try:
-        ak = (AE_APP_KEY or "")
-        tid = (AE_TRACKING_ID or "")
-        lines.append("בדיקת הגדרות AliExpress:")
-        lines.append(f"• app_key: {ak[:3]}***{ak[-3:] if len(ak)>6 else ''}")
-        lines.append(f"• tracking_id: {tid[:3]}***{tid[-3:] if len(tid)>6 else ''}")
-        lines.append(f"• target_language/currency: {AE_TARGET_LANGUAGE}/{AE_TARGET_CURRENCY}")
-        lines.append(f"• ship_to: {AE_SHIP_TO_COUNTRY}")
-        lines.append("מבצע קריאת בדיקה...")
-
-        try:
-            res = AE.search_products("test", page_size=1)
-            items = res.get("items", [])
-            dbg = res.get("_debug", {})
-            if items:
-                lines.append("✅ חיפוש החזיר תוצאה אחת לפחות.")
-            else:
-                lines.append("⚠️ אין תוצאות. ייתכן שזו מגבלת חשבון/מעקב או שגיאת חתימה.")
-            if dbg:
-                lines.append(f"debug: sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')} ep={dbg.get('endpoint')}")
-            if res.get("error"):
-                lines.append(f"server hint: {res.get('error')}")
-        except Exception as e:
-            lines.append(f"❌ שגיאת קריאת API: {e}")
-    except Exception as e:
-        lines.append(f"שגיאה פנימית: {e}")
-
-    bot.reply_to(m, nfc("\n".join(lines)))
-
-
-
-
-
-
-
-
-@bot.message_handler(commands=["queue_status"])
-def cmd_queue_status(m: types.Message):
-    try:
-        rows = read_queue()
-        n = len(rows)
-        preview = []
-        for i, r in enumerate(rows[:3], start=1):
-            pid = r.get("ProductId","")
-            title = r.get("Title") or r.get("Product Desc") or ""
-            preview.append(f"{i}. {title[:40]} (#{pid})")
-        if not preview:
-            bot.reply_to(m, nfc("התור ריק."))
-            return
-        bot.reply_to(m, nfc("כמות בתור: " + str(n) + "\n" + "\n".join(preview)))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת בדיקת תור: {e}"))
-
-
-@bot.message_handler(commands=["version"])
-def cmd_version(m: types.Message):
-    bot.reply_to(m, nfc("גרסה: v2025-08-28T21:25:48"))
-
-
-@bot.message_handler(commands=["env_channels"])
-def cmd_env_channels(m: types.Message):
-    try:
-        cid_cfg = GLOBAL_CONFIG.get("channel_id")
-        cid_env = os.getenv("CHANNEL_ID", "")
-        ctype = GLOBAL_CONFIG.get("channel_type")
-        owner = GLOBAL_CONFIG.get("admin_user_id")
-        bot.reply_to(m, nfc(f"config.channel_id={cid_cfg}\nenv.CHANNEL_ID={cid_env}\nchannel_type={ctype}\nadmin_user_id={owner}"))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת env: {e}"))
-
-
-def build_main_menu_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add(types.KeyboardButton("🗂️ ניהול תור"), types.KeyboardButton("➕ משוך מוצרים"))
-    kb.add(types.KeyboardButton("📤 העלאת קובץ"), types.KeyboardButton("🚀 פרסם עכשיו"))
-    kb.add(types.KeyboardButton("🔥 מוצרים חמים"), types.KeyboardButton("🔎 מוצר לפי ID"))
-    kb.add(types.KeyboardButton("⚙️ הגדרות ערוץ"))
-    return kb
-
-@bot.message_handler(commands=["menu"])
-def cmd_menu(m: types.Message):
-    kb = build_main_menu_kb()
-    bot.reply_to(m, nfc("תפריט ראשי"), reply_markup=kb)
-
-@bot.message_handler(commands=["settings"])
-def cmd_settings(m: types.Message):
-    if not is_admin(m.from_user.id):
-        bot.reply_to(m, nfc("אין הרשאה לפתוח הגדרות ערוץ."))
-        return
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    kb.add(types.KeyboardButton("🔓 קבע ערוץ ציבורי (@username)"))
-    kb.add(types.KeyboardButton("🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)"))
-    kb.add(types.KeyboardButton("ℹ️ מצב ערוץ נוכחי"))
-    bot.reply_to(m, nfc("בחר/י פעולה לערוץ:"), reply_markup=kb)
-
-
-@bot.message_handler(commands=["set_public"])
-def cmd_set_public(m: types.Message):
-    if not is_admin(m.from_user.id):
-        bot.reply_to(m, nfc("אין הרשאה.")); return
-    parts = (m.text or "").split()
-    if len(parts) < 2 or not parts[1].startswith("@"):
-        bot.reply_to(m, nfc("שימוש: /set_public @channel_username"))
-        return
-    set_channel_binding("public", parts[1], m.from_user.id)
-    bot.reply_to(m, nfc(f"הוגדר ערוץ ציבורי: {parts[1]}"))
-
-@bot.message_handler(commands=["set_private"])
-def cmd_set_private(m: types.Message):
-    if not is_admin(m.from_user.id):
-        bot.reply_to(m, nfc("אין הרשאה.")); return
-    parts = (m.text or "").split()
-    if len(parts) < 2:
-        bot.reply_to(m, nfc("שימוש: /set_private -100xxxxxxxxxx  (או שלח הודעה מועברת מהערוץ דרך הכפתור)"))
-        return
-    val = parts[1].strip()
-    try:
-        if not val.startswith("-100"):
-            raise ValueError("Chat ID צריך להתחיל ב-100-")
-        int(val)  # validate numeric
+        if isinstance(value, int):
+            return value
+        s = str(value).strip()
+        if s.startswith("-"):
+            return int(s)
+        return s
     except Exception:
-        bot.reply_to(m, nfc("Chat ID לא תקין. דוגמה: -1001234567890"))
-        return
-    set_channel_binding("private", val, m.from_user.id)
-    bot.reply_to(m, nfc(f"הוגדר ערוץ פרטי: {val}"))
+        return value
 
-# ========= תפריט /start =========
-def make_main_kb() -> types.ReplyKeyboardMarkup:
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    row1 = [types.KeyboardButton("🚀 פרסם עכשיו"), types.KeyboardButton("📜 מצב תור")]
-    row2 = [types.KeyboardButton("⏱️ שינוי דיליי"), types.KeyboardButton("🔁 מצב אוטומטי")]
-    row3 = [types.KeyboardButton("🔄 טען מחדש את התור"), types.KeyboardButton("🧪 בדיקת AliExpress"), types.KeyboardButton("🛠️ אבחון AliExpress")]
-    row4 = [types.KeyboardButton("🗂️ ניהול תור"), types.KeyboardButton("➕ משוך מוצרים"), types.KeyboardButton("📤 העלאת קובץ")]
-    kb.add(*row1); kb.add(*row2); kb.add(*row3); kb.add(*row4)
-    kb.add(types.KeyboardButton("⚙️ הגדרות ערוץ"))
-    kb.add(types.KeyboardButton("🔥 מוצרים חמים"))
-    kb.add(types.KeyboardButton("🔎 מוצר לפי ID"))
-    return kb
-
-@bot.message_handler(commands=["start"])
-def cmd_start(m: types.Message):
-    st = read_state()
-    write_auto_flag("on" if st.get("auto", True) else "off")
-    delay = int(st.get("delay", DEFAULT_DELAY_SEC))
-    kb = make_main_kb()
-    bot.send_message(
-        m.chat.id,
-        nfc(
-            "ברוך הבא 👋\n"
-            f"מצב אוטומטי: {'פעיל' if read_auto_flag()=='on' else 'כבוי'}\n"
-            f"דיליי נוכחי: {delay//60} דק׳ ({delay} שניות)\n"
-            f"שעות שקטות: {'מוגדר' if (QUIET_START and QUIET_END) else 'לא מוגדר'}\n"
-            "בחר פעולה:"
-        ),
-        reply_markup=kb
-    )
-
-@bot.message_handler(func=lambda msg: msg.text == "🚀 פרסם עכשיו")
-def on_post_now(m: types.Message):
-    ok, info = post_next_from_queue()
-    bot.reply_to(m, nfc(("✅ " if ok else "❌ ") + info))
-
-@bot.message_handler(func=lambda msg: msg.text == "📜 מצב תור")
-def on_queue_status(m: types.Message):
-    st = read_state()
-    qlen = len(read_queue())
-    idx = int(st.get("index", 0))
-    left = max(0, qlen - idx)
-    bot.reply_to(m, nfc(f"בתור: {qlen} | פורסמו: {idx} | נשארו: {left}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "🔄 טען מחדש את התור")
-def on_reload_queue(m: types.Message):
-    st = read_state()
-    q = read_queue()
-    if int(st.get("index", 0)) > len(q):
-        st["index"] = 0
-        write_state(st)
-    bot.reply_to(m, nfc(f"התור נטען מחדש. פריטים בקובץ: {len(q)}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "🔁 מצב אוטומטי")
-def on_toggle_auto(m: types.Message):
-    st = read_state()
-    new_auto = not st.get("auto", True)
-    st["auto"] = new_auto
-    write_state(st)
-    write_auto_flag("on" if new_auto else "off")
-    DELAY_EVENT.set()
-    bot.reply_to(m, nfc(f"מצב אוטומטי כעת: {'פעיל' if new_auto else 'כבוי'}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "⏱️ שינוי דיליי")
-def on_change_delay(m: types.Message):
-    bot.reply_to(m, nfc("שלח מספר שניות (למשל 1200) או דקות עם m (למשל 20m):"))
-
-@bot.message_handler(regexp=r"^\s*\d+\s*(m|M)?\s*$")
-def on_delay_value(m: types.Message):
-    text = m.text.strip()
-    minutes = text.lower().endswith("m")
-    num = int(text[:-1]) if minutes else int(text)
-    sec = num * 60 if minutes else num
-    st = read_state()
-    st["delay"] = max(60, sec)  # מינימום דקה
-    write_state(st)
-    DELAY_EVENT.set()
-    bot.reply_to(m, nfc(f"דיליי עודכן ל-{st['delay']//60} דק׳ ({st['delay']} שניות)"))
-
-# ========= בדיקת AliExpress =========
-@bot.message_handler(func=lambda msg: msg.text == "🧪 בדיקת AliExpress")
-@bot.message_handler(func=lambda msg: msg.text == "🛠️ אבחון AliExpress")
-def on_test_ae(m: types.Message):
-    msg = bot.reply_to(m, nfc("שלח מילת חיפוש קצרה (למשל: bluetooth speaker):"))
-    bot.register_next_step_handler(msg, do_test_ae_keyword)
-
-def do_test_ae_keyword(m: types.Message):
-    kw = (m.text or "").strip()
-    if not kw:
-        bot.reply_to(m, nfc("לא התקבלה מילת חיפוש"))
-        return
+def check_and_probe_target(target):
     try:
-        res = AE.search_products(kw, page_size=5)
-        items = res.get("items", [])
-        if not items:
-            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}"))
-            return
-        lines = [f"נמצאו {len(items)} תוצאות ל־“{kw}”:", ""]
-        for it in items[:5]:
-            title = nfc(it.get("title") or "")
-            pid = it.get("productId") or it.get("product_id") or ""
-            lines.append(f"• {title} (ID: {pid})")
-        bot.reply_to(m, nfc("\n".join(lines)))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאה בבדיקה: {e}"))
-
-
-# ========= העלאת קובץ ידנית =========
-AWAITING_UPLOAD = {}
-
-@bot.message_handler(func=lambda msg: msg.text == "📤 העלאת קובץ")
-def on_upload_prompt(m: types.Message):
-    AWAITING_UPLOAD[m.chat.id] = True
-    bot.reply_to(m, nfc("שלח/י כעת קובץ CSV עם העמודות הבאות (אפשר גם TSV):\n" + ", ".join(REQUIRED_UPLOAD_COLUMNS)))
-
-@bot.message_handler(content_types=['document'])
-def on_document_upload(m: types.Message):
-    want = AWAITING_UPLOAD.get(m.chat.id, False)
-    filename = m.document.file_name or ""
-    ext = (filename.split(".")[-1] if "." in filename else "").lower()
-    if not want and ext not in ("csv","tsv","txt"):
-        # not in upload mode and not recognized
-        return
-    try:
-        file_info = bot.get_file(m.document.file_id)
-        data = bot.download_file(file_info.file_path)
-        ts = dt.datetime.now(TZ).strftime("%Y%m%d-%H%M%S")
-        save_path = os.path.join(UPLOADS_DIR, f"{ts}-{filename or 'upload.csv'}")
-        with open(save_path, "wb") as f:
-            f.write(data)
-        added, msg = import_products_from_csv(save_path)
+        t = resolve_target(target)
+        chat = bot.get_chat(t)
         try:
-            DELAY_EVENT.set()
-        except Exception:
-            pass
-        bot.reply_to(m, nfc(f"נטען הקובץ {filename}. נוספו {added} פריטים לתור.\n{msg}"))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאה בקליטת הקובץ: {e}"))
-    finally:
-        AWAITING_UPLOAD[m.chat.id] = False
-
-def import_products_from_csv(path: str) -> (int, str):
-    # Detect delimiter
-    try:
-        with open(path, "r", encoding="utf-8-sig") as f:
-            sample = f.read(4096)
-        delim = ","
-        if "\t" in sample and sample.count("\t") > sample.count(","):
-            delim = "\t"
-        else:
+            me = bot.get_me()
+            member = bot.get_chat_member(chat.id, me.id)
+            status = getattr(member, "status", "")
+            if status not in ("administrator", "creator"):
+                return False, f"⚠️ הבוט אינו אדמין ביעד {chat.id}."
+        except Exception as e_mem:
+            print("[WARN] get_chat_member failed:", e_mem, flush=True)
+        try:
+            m = bot.send_message(chat.id, "🟢 בדיקת הרשאה (תימחק מיד).", disable_notification=True)
             try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
-                delim = dialect.delimiter
+                bot.delete_message(chat.id, m.message_id)
             except Exception:
                 pass
-        # Read rows
-        rows = []
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f, delimiter=delim)
-            headers = [h.strip() for h in reader.fieldnames or []]
-            # Validate required columns
-            missing = [c for c in REQUIRED_UPLOAD_COLUMNS if c not in headers]
-            warn = ""
-            if missing:
-                warn = "אזהרה: חסרות העמודות הבאות: " + ", ".join(missing)
-            for r in reader:
-                # Normalize keys
-                r = { (k.strip() if k else k): (v.strip() if isinstance(v,str) else v) for k,v in r.items() }
-                # Map to queue format + keep extras
-                mapped = {
-                    "ProductId": r.get("ProductId",""),
-                    "Image Url": r.get("Image Url",""),
-                    "Product Desc": r.get("Product Desc",""),
-                    "Opening": "",
-                    "Title": r.get("Product Desc",""),
-                    "Strengths": "",
-                    "Promotion Url": r.get("Promotion Url",""),
-                }
-                # Keep all original extra fields
-                for k,v in r.items():
-                    if k not in mapped:
-                        mapped[k] = v
-                rows.append(mapped)
-        if not rows:
-            return 0, (warn or "לא נמצאו שורות תקינות.")
-        added = append_to_queue(rows)
-        try:
-            print(f"[{now_str()}] Import: {len(rows)} read, {added} appended to queue.csv", flush=True)
-        except Exception:
-            pass
-        return added, (warn or "OK")
+            return True, f"✅ יעד תקין: {chat.title or chat.id}"
+        except Exception as e_send:
+            return False, f"❌ לא הצלחתי לפרסם ביעד: {e_send}"
     except Exception as e:
-        return 0, f"שגיאה בקריאת CSV: {e}"
+        return False, f"❌ יעד לא תקין: {e}"
 
 
-# ========= בדיקות AliExpress (חמים / לפי ID / URL) =========
-@bot.message_handler(func=lambda msg: msg.text == "🔥 מוצרים חמים")
-def on_hot_products(m: types.Message):
+# ========= BROADCAST WINDOW =========
+def should_broadcast(now: datetime | None = None) -> bool:
+    if now is None:
+        now = datetime.now(tz=IL_TZ)
+    else:
+        now = now.astimezone(IL_TZ)
+    wd = now.weekday()  # Mon=0 ... Sun=6 (אצלנו: ראשון=6)
+    t = now.time()
+    if wd in (6, 0, 1, 2, 3):
+        return dtime(6, 0) <= t <= dtime(23, 59)
+    if wd == 4:
+        return dtime(6, 0) <= t <= dtime(17, 59)
+    if wd == 5:
+        return dtime(20, 15) <= t <= dtime(23, 59)
+    return False
+
+def is_schedule_enforced() -> bool:
+    return os.path.exists(SCHEDULE_FLAG_FILE)
+
+def set_schedule_enforced(enabled: bool) -> None:
     try:
-        res = AE.hot_products(page_size=10)
-        items = res.get("items", [])
-        if not items:
-            hint = ""
-            if res.get("error"):
-                hint = f"\n(רמז מהשרת: {res.get('error')})"
-            dbg = res.get("_debug") or {}
-            if dbg:
-                hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc("לא נמצאו פריטים חמים." + hint))
-            return
-        rows = []
-        for it in items:
-            rows.append({
-                "ProductId": it.get("productId") or "",
-                "Image Url": it.get("imageUrl") or "",
-                "Product Desc": it.get("title") or "",
-                "Opening": "",
-                "Title": it.get("title") or "",
-                "Strengths": "",
-                "Promotion Url": it.get("promotionUrl") or "",
-            })
-        added = append_to_queue(rows)
-        bot.reply_to(m, nfc(f"נוספו {added} פריטים חמים לתור."))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת חיפוש חמים: {e}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "🔎 מוצר לפי ID")
-def on_prompt_id(m: types.Message):
-    msg = bot.reply_to(m, nfc("שלח/י עכשיו ProductId (מספר, למשל 4001234567890) או הדבק כתובת מוצר AliExpress."))
-    bot.register_next_step_handler(msg, on_receive_id_or_url)
-
-def on_receive_id_or_url(m: types.Message):
-    txt = (m.text or "").strip()
-    pid = None
-    import re as _re
-    mobj = _re.search(r"/item/(\d+)\.html", txt)
-    if mobj:
-        pid = mobj.group(1)
-    elif txt.isdigit():
-        pid = txt
-    if not pid:
-        bot.reply_to(m, nfc("לא זוהה ProductId תקין."))
-        return
-    try:
-        data = AE.get_product_detail(pid)
-        items = []
-        for path in [
-            ("resp_result","result","result"),
-            ("result","result"),
-            ("result","items"),
-            ("items",),
-        ]:
-            cur = data
-            for pth in path:
-                if isinstance(cur, dict):
-                    cur = cur.get(pth)
-                else:
-                    cur = None
-                    break
-            if isinstance(cur, list):
-                items = cur
-                break
-        if not items and isinstance(data, dict) and isinstance(data.get("result"), dict):
-            items = [data.get("result")]
-
-        if not items:
-            hint = ""
-            if isinstance(data, dict):
-                for k in ("resp_msg","message","msg","errorMessage","error_message","error"):
-                    if data.get(k):
-                        hint = f"\n(רמז מהשרת: {data.get(k)})"; break
-                dbg = data.get("_debug") or {}
-                if dbg:
-                    hint += f"\n[debug ep={dbg.get('endpoint')} sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc(f"לא הוחזרו פרטים עבור המוצר {pid}.{hint}"))
-            return
-
-        it = items[0] if isinstance(items, list) else items
-        row = {
-            "ProductId": it.get("productId") or it.get("target_id") or pid,
-            "Image Url": it.get("image") or it.get("image_url") or it.get("product_main_image_url") or "",
-            "Product Desc": it.get("product_title") or it.get("title") or it.get("subject") or "",
-            "Opening": "",
-            "Title": it.get("product_title") or it.get("title") or it.get("subject") or "",
-            "Strengths": "",
-            "Promotion Url": it.get("promotion_link") or it.get("promotionUrl") or it.get("target_url") or f"https://www.aliexpress.com/item/{pid}.html",
-        }
-        added = append_to_queue([row])
-        bot.reply_to(m, nfc(f"פרטי מוצר {pid} נוספו לתור ({added})."))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאת פירוט מוצר: {e}"))
-
-
-def publish_next() -> bool:
-    """
-    Pulls first row from queue and posts it to the channel. Returns True if posted.
-    Reuses the same logic used by the poster loop.
-    """
-    rows = read_queue()
-    if not rows:
-        return False
-    row = rows[0]
-    # try to post
-    try:
-        text = build_post(row)
-        image = (row.get("Image Url") or "").strip()
-        link  = (row.get("Promotion Url") or "").strip()
-        # If there's an image URL, try photo; else send text
-        if image:
-            bot.send_photo(parse_chat_id(get_current_channel_id()), image, caption=text, parse_mode="HTML", disable_web_page_preview=True)
+        if enabled:
+            with open(SCHEDULE_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write("schedule=on")
         else:
-            bot.send_message(parse_chat_id(get_current_channel_id()), text, parse_mode="HTML", disable_web_page_preview=True)
+            if os.path.exists(SCHEDULE_FLAG_FILE):
+                os.remove(SCHEDULE_FLAG_FILE)
     except Exception as e:
-        print(f"[{now_str()}] Failed to post: {e}", flush=True)
-        return False
-    # remove the posted row from queue
-    rest = rows[1:]
-    write_csv_rows(QUEUE_CSV, rest, fieldnames=list(rows[0].keys()))
-    return True
+        print(f"[WARN] Failed to set schedule mode: {e}", flush=True)
+
+def is_quiet_now(now: datetime | None = None) -> bool:
+    return not should_broadcast(now) if is_schedule_enforced() else False
 
 
-
-from telebot import types as _types
-from telebot import apihelper as _apihelper  # alias for inline keyboards
-
-def open_inline_settings(chat_id: int):
-    ikb = _types.InlineKeyboardMarkup(row_width=1)
-    ikb.add(
-        _types.InlineKeyboardButton("🔓 קבע ערוץ ציבורי (@username)", callback_data="set_public_inline"),
-        _types.InlineKeyboardButton("🔒 קבע ערוץ פרטי (Forward מהערוץ)", callback_data="set_private_inline"),
-        _types.InlineKeyboardButton("ℹ️ מצב ערוץ נוכחי", callback_data="status_inline")
-    )
-    bot.send_message(chat_id, nfc("הגדרות ערוץ (Inline) — בחר פעולה:"), reply_markup=ikb)
-
-@bot.message_handler(commands=["settings"])
-def cmd_settings(m: types.Message):
-    if not is_admin(m.from_user.id):
-        bot.reply_to(m, nfc("אין הרשאה לפתוח הגדרות ערוץ.")); return
-    open_inline_settings(m.chat.id)
-
-@bot.callback_query_handler(func=lambda c: c.data in ("set_public_inline","set_private_inline","status_inline"))
-def on_settings_inline(c: types.CallbackQuery):
+# ========= SAFE EDIT =========
+def safe_edit_message(bot, *, chat_id: int, message, new_text: str, reply_markup=None, parse_mode=None, cb_id=None, cb_info=None):
     try:
-        if not is_admin(c.from_user.id):
-            bot.answer_callback_query(c.id, "אין הרשאה", show_alert=True); return
-        if c.data == "status_inline":
-            cid = get_current_channel_id() or "(לא הוגדר)"
-            ctype = GLOBAL_CONFIG.get("channel_type") or ("public" if str(cid).startswith("@") else "private" if str(cid).startswith("-100") else "(לא ידוע)")
-            owner = GLOBAL_CONFIG.get("admin_user_id")
-            bot.answer_callback_query(c.id, "נשלח מצב לערוץ")
-            bot.send_message(c.message.chat.id, nfc(f"ערוץ נוכחי: {cid}\nסוג: {ctype}\nמנהל: {owner if owner else '(לא הוגדר)'}"))
-        elif c.data == "set_public_inline":
-            msg = bot.send_message(c.message.chat.id, nfc("שלח/י עכשיו @שם_הערוץ הציבורי (למשל @best_deals)."))
-            bot.register_next_step_handler(msg, on_set_public_value)
-        elif c.data == "set_private_inline":
-            msg = bot.send_message(c.message.chat.id, nfc("העבר/י כעת הודעה מהערוץ (Forward) כדי לזהות את ה-Chat ID."))
-            bot.register_next_step_handler(msg, on_set_private_value)
+        curr_text = (message.text or message.caption or "")
+        if curr_text == (new_text or ""):
+            try:
+                if reply_markup is not None:
+                    bot.edit_message_reply_markup(chat_id, message.message_id, reply_markup=reply_markup)
+                    if cb_id:
+                        bot.answer_callback_query(cb_id)
+                    return
+                if cb_id:
+                    bot.answer_callback_query(cb_id)
+                return
+            except Exception as e_rm:
+                if "message is not modified" in str(e_rm):
+                    if cb_id:
+                        bot.answer_callback_query(cb_id)
+                    return
+        bot.edit_message_text(new_text, chat_id, message.message_id, reply_markup=reply_markup, parse_mode=parse_mode)
+        if cb_id:
+            bot.answer_callback_query(cb_id)
     except Exception as e:
-        bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=True)
-
-# ========= Channel Settings =========
-@bot.message_handler(func=lambda msg: msg.text == "⚙️ הגדרות ערוץ")
-def on_channel_settings(m: types.Message):
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
-    kb.add(types.KeyboardButton("🔓 קבע ערוץ ציבורי (@username)"))
-    kb.add(types.KeyboardButton("🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)"))
-    kb.add(types.KeyboardButton("ℹ️ מצב ערוץ נוכחי"))
-    bot.reply_to(m, nfc("בחר/י פעולה לערוץ:"), reply_markup=kb)
-
-@bot.message_handler(func=lambda msg: msg.text == "ℹ️ מצב ערוץ נוכחי")
-def on_channel_status(m: types.Message):
-    cid = get_current_channel_id() or "(לא הוגדר)"
-    ctype = GLOBAL_CONFIG.get("channel_type") or ("public" if str(cid).startswith("@") else "private" if str(cid).startswith("-100") else "(לא ידוע)")
-    owner = GLOBAL_CONFIG.get("admin_user_id")
-    bot.reply_to(m, nfc(f"ערוץ נוכחי: {cid}\nסוג: {ctype}\nמנהל: {owner if owner else '(לא הוגדר)'}"))
-
-@bot.message_handler(func=lambda msg: msg.text == "🔓 קבע ערוץ ציבורי (@username)")
-def on_set_public_prompt(m: types.Message):
-    bot.reply_to(m, nfc("שלח/י עכשיו @שם_הערוץ הציבורי (למשל @best_deals)."))
-    bot.register_next_step_handler(m, on_set_public_value)
-
-def on_set_public_value(m: types.Message):
-    try:
-        if not is_admin(m.from_user.id):
-            bot.reply_to(m, nfc("אין הרשאה לביצוע פעולה זו."))
+        if "message is not modified" in str(e):
+            if cb_id:
+                bot.answer_callback_query(cb_id)
             return
-        txt = (m.text or "").strip()
-        if not txt.startswith("@") or " " in txt or len(txt) < 3:
-            bot.reply_to(m, nfc("שם משתמש לא תקין. שלח/י שוב במבנה @channel_name."))
-            return
-        set_channel_binding("public", txt, m.from_user.id)
-        bot.reply_to(m, nfc(f"הוגדר ערוץ ציבורי: {txt}\nודא/י שהבוט אדמין בערוץ עם הרשאת פרסום."))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאה בהגדרת ערוץ ציבורי: {e}"))
+        if cb_id and cb_info:
+            bot.answer_callback_query(cb_id, cb_info + f" (שגיאה: {e})", show_alert=True)
+        else:
+            raise
 
-@bot.message_handler(func=lambda msg: msg.text == "🔒 קבע ערוץ פרטי (שלח הודעה מהערוץ)")
-def on_set_private_prompt(m: types.Message):
-    bot.reply_to(m, nfc("מעולה. העבר/י כעת הודעה מהערוץ שאליו ננעל. (Forward מהערוץ לכאן)"))
-    bot.register_next_step_handler(m, on_set_private_value)
 
-def _extract_channel_id_from_message(msg: types.Message):
-    # Try multiple attributes because Telegram can populate different fields
+# ========= POSTING =========
+def format_post(product):
+    item_id = product.get('ItemId', 'ללא מספר')
+    image_url = product.get('ImageURL', '')
+    title = (product.get('Title') or product.get('Product Desc') or '').strip()
+    original_price = product.get('OriginalPrice', '')
+    sale_price = product.get('SalePrice', '')
+    discount = product.get('Discount', '')
+    rating = product.get('Rating', '')
+    orders = product.get('Orders', '')
+    buy_link = product.get('BuyLink', '')
+    coupon = product.get('CouponCode', '')
+
+    opening = (product.get('Opening') or '').strip()
+    strengths_src = (product.get("Strengths") or "").strip()
+
+    rating_percent = rating if rating else "אין דירוג"
+    orders_num = safe_int(orders, default=0)
+    orders_text = f"{orders_num} הזמנות" if orders_num >= 50 else "פריט חדש לחברי הערוץ"
+    discount_text = f"💸 חיסכון של {discount}!" if discount and discount != "0%" else ""
+    coupon_text = f"🎁 קופון לחברי הערוץ בלבד: {coupon}" if str(coupon).strip() else ""
+
+    lines = []
+    if opening:
+        lines.append(opening)
+        lines.append("")
+    if title:
+        lines.append(title)
+        lines.append("")
+
+    if strengths_src:
+        for part in [p.strip() for p in strengths_src.replace("|", "\n").replace(";", "\n").split("\n")]:
+            if part:
+                lines.append(part)
+        lines.append("")
+
+    price_line = f'💰 מחיר מבצע: <a href="{buy_link}">{sale_price} ש"ח</a> (מחיר מקורי: {original_price} ש"ח)'
+    lines += [
+        price_line,
+        discount_text,
+        f"⭐ דירוג: {rating_percent}",
+        f"📦 {orders_text}",
+        "🚚 משלוח חינם מעל 38 ש\"ח או 7.49 ש\"ח",
+        "",
+        coupon_text if coupon_text else "",
+        "",
+        f'להזמנה מהירה👈 <a href="{buy_link}">לחצו כאן</a>',
+        "",
+        f"מספר פריט: {item_id}",
+        'להצטרפות לערוץ לחצו כאן👈 <a href="https://t.me/+LlMY8B9soOdhNmZk">קליק והצטרפתם</a>',
+        "",
+        "👇🛍הזמינו עכשיו🛍👇",
+        f'<a href="{buy_link}">לחיצה וזה בדרך </a>',
+    ]
+
+    post = "\n".join([l for l in lines if l is not None and str(l).strip() != ""])
+    return post, image_url
+
+def post_to_channel(product):
     try:
-        if getattr(msg, "forward_from_chat", None) and getattr(msg.forward_from_chat, "type", "") == "channel":
-            return msg.forward_from_chat.id, getattr(msg.forward_from_chat, "title", None)
-        if getattr(msg, "sender_chat", None) and getattr(msg.sender_chat, "type", "") == "channel":
-            return msg.sender_chat.id, getattr(msg.sender_chat, "title", None)
-        # If user posts directly from channel via bot (rare), msg.chat might be the channel
-        if getattr(msg, "chat", None) and getattr(msg.chat, "type", "") == "channel":
-            return msg.chat.id, getattr(msg.chat, "title", None)
+        post_text, image_url = format_post(product)
+        video_url = (product.get('Video Url') or "").strip()
+        target = resolve_target(CURRENT_TARGET)
+        if video_url.endswith('.mp4') and video_url.startswith("http"):
+            resp = SESSION.get(video_url, timeout=20)
+            resp.raise_for_status()
+            bot.send_video(target, resp.content, caption=post_text)
+        else:
+            resp = SESSION.get(image_url, timeout=20)
+            resp.raise_for_status()
+            bot.send_photo(target, resp.content, caption=post_text)
+    except Exception as e:
+        print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Failed to post: {e}", flush=True)
+
+
+# ========= ATOMIC SEND =========
+def send_next_locked(source: str = "loop") -> bool:
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: no pending", flush=True)
+            return False
+
+        item = pending[0]
+        item_id = (item.get("ItemId") or "").strip()
+        title = (item.get("Title") or "").strip()[:120]
+        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sending ItemId={item_id} | Title={title}", flush=True)
+
+        try:
+            post_to_channel(item)
+        except Exception as e:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: send FAILED: {e}", flush=True)
+            return False
+
+        try:
+            write_products(PENDING_CSV, pending[1:])
+        except Exception as e:
+            print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED, retry once: {e}", flush=True)
+            time.sleep(0.2)
+            try:
+                write_products(PENDING_CSV, pending[1:])
+            except Exception as e2:
+                print(f"[{datetime.now(tz=IL_TZ)}] {source}: write FAILED permanently: {e2}", flush=True)
+                return True
+
+        print(f"[{datetime.now(tz=IL_TZ)}] {source}: sent & advanced queue", flush=True)
+        return True
+
+
+# ========= DELAY =========
+
+# ========= AUTO DELAY MODE =========
+AUTO_FLAG_FILE = os.path.join(BASE_DIR, "auto_delay.flag")
+
+
+AUTO_SCHEDULE = [
+    (dtime(6, 0), dtime(9, 0), 1200),
+    (dtime(9, 0), dtime(15, 0), 1500),
+    (dtime(15, 0), dtime(22, 0), 1200),
+    (dtime(22, 0), dtime(23, 59), 1500),
+]
+
+
+def read_auto_flag():
+    try:
+        with open(AUTO_FLAG_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except:
+        return "on"
+
+def write_auto_flag(value):
+    with open(AUTO_FLAG_FILE, "w", encoding="utf-8") as f:
+        f.write(value)
+
+def get_auto_delay():
+    now = datetime.now(IL_TZ).time()
+    for start, end, delay in AUTO_SCHEDULE:
+        if start <= now <= end:
+            return delay
+    return None
+
+def load_delay_seconds(default_seconds: int = 1500) -> int:
+    try:
+        if os.path.exists(DELAY_FILE):
+            with open(DELAY_FILE, "r", encoding="utf-8") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
     except Exception:
         pass
-    return None, None
+    return default_seconds
 
-def on_set_private_value(m: types.Message):
+def save_delay_seconds(seconds: int) -> None:
     try:
-        if not is_admin(m.from_user.id):
-            bot.reply_to(m, nfc("אין הרשאה לביצוע פעולה זו."))
-            return
-        cid, title = _extract_channel_id_from_message(m)
-        if not cid:
-            bot.reply_to(m, nfc("לא הצלחתי לזהות את הערוץ מההודעה. ודא/י שזה Forward אמיתי מהערוץ."))
-            return
-        set_channel_binding("private", str(cid), m.from_user.id)
-        bot.reply_to(m, nfc(f"הוגדר ערוץ פרטי: {cid}\nכותרת: {title or ''}\nהבוט חייב להיות אדמין בערוץ."))
+        with open(DELAY_FILE, "w", encoding="utf-8") as f:
+            f.write(str(seconds))
     except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאה בהגדרת ערוץ פרטי: {e}"))
+        print(f"[WARN] Failed to save delay: {e}", flush=True)
 
-# ========= משיכת מוצרים לתור =========
-@bot.message_handler(func=lambda msg: msg.text == "➕ משוך מוצרים")
-def on_fetch_to_queue(m: types.Message):
-    msg = bot.reply_to(m, nfc("שלח מילת חיפוש ונמשוך עד 10 פריטים לתור:"))
-    bot.register_next_step_handler(msg, do_fetch_keyword)
+POST_DELAY_SECONDS = load_delay_seconds(1500)  # 25 דקות
 
-def do_fetch_keyword(m: types.Message):
-    kw = (m.text or "").strip()
-    if not kw:
-        bot.reply_to(m, nfc("לא התקבלה מילת חיפוש"))
-        return
-    try:
-        res = AE.search_products(kw, page_size=10)
-        items = res.get("items", [])
-        if not items:
-            hint = ""
-            if res.get("error"):
-                hint = f"\n(רמז מהשרת: {res.get('error')})"
-            dbg = res.get("_debug") or {}
-            if dbg:
-                hint += f"\n[debug sign={dbg.get('sign_method_used')} ts={dbg.get('timestamp_mode')}]"
-            bot.reply_to(m, nfc(f"לא נמצאו פריטים ל: {kw}{hint}\nטיפים: נסו מילת חיפוש באנגלית, או ודאו שה-Tracking ID תקין."))
-            return
-        rows = []
-        for it in items:
-            rows.append({
-                "ProductId": it.get("productId") or it.get("product_id") or "",
-                "Image Url": it.get("imageUrl") or it.get("image") or "",
-                "Product Desc": it.get("title") or "",
-                "Opening": "",
-                "Title": it.get("title") or "",
-                "Strengths": "",
-                "Promotion Url": it.get("promotionUrl") or it.get("promotion_url") or "",
-            })
-        added = append_to_queue(rows)
-        bot.reply_to(m, nfc(f"נוספו {added} פריטים לתור מתוך החיפוש ל־“{kw}”"))
-    except Exception as e:
-        bot.reply_to(m, nfc(f"שגיאה במשיכה: {e}"))
-# ========= ניהול תור (עיון/מחיקה) =========
-BROWSE_INDEX: Dict[int, int] = {}  # chat_id -> index להצגה
 
-@bot.message_handler(func=lambda msg: msg.text == "🗂️ ניהול תור")
-def on_manage_queue(m: types.Message):
-    BROWSE_INDEX[m.chat.id] = 0
-    return send_queue_preview(m.chat.id)
+# ========= ADMIN =========
+def _is_admin(msg) -> bool:
+    if not ADMIN_USER_IDS:
+        return True
+    return msg.from_user and (msg.from_user.id in ADMIN_USER_IDS)
 
-def make_queue_inline_kb() -> types.InlineKeyboardMarkup:
-    kb = types.InlineKeyboardMarkup()
+
+# ========= MERGE =========
+def merge_from_data_into_pending():
+    data_rows = read_products(DATA_CSV)
+    pending_rows = read_products(PENDING_CSV)
+
+    def key_of(r):
+        item_id = (r.get("ItemId") or "").strip()
+        title = (r.get("Title") or "").strip()
+        buy = (r.get("BuyLink") or "").strip()
+        return (item_id if item_id else None, title if not item_id else None, buy)
+
+    existing_keys = {key_of(r) for r in pending_rows}
+    added = 0
+    already = 0
+
+    for r in data_rows:
+        k = key_of(r)
+        if k in existing_keys:
+            already += 1
+            continue
+        pending_rows.append(r)
+        existing_keys.add(k)
+        added += 1
+
+    write_products(PENDING_CSV, pending_rows)
+    return added, already, len(pending_rows)
+
+
+# ========= DELETE HELPERS =========
+def _key_of_row(r: dict):
+    item_id = (r.get("ItemId") or "").strip()
+    title   = (r.get("Title") or "").strip()
+    buy     = (r.get("BuyLink") or "").strip()
+    return (item_id if item_id else None, title if not item_id else None, buy)
+
+def delete_source_csv_file():
+    """
+    מוחק את workfile.csv (משאיר קובץ ריק עם כותרות) — לא נוגע בתור.
+    """
+    with FILE_LOCK:
+        write_products(DATA_CSV, [])
+    return True
+
+def delete_source_rows_from_pending():
+    """
+    קורא את workfile.csv ומסיר מהתור (pending.csv) את כל הרשומות שנוספו ממנו,
+    לפי אותו מפתח מניעת-כפילויות (ItemId/Title/BuyLink).
+    """
+    with FILE_LOCK:
+        src_rows = read_products(DATA_CSV)
+        if not src_rows:
+            return 0, 0
+
+        src_keys = {_key_of_row(r) for r in src_rows}
+        pending_rows = read_products(PENDING_CSV)
+        if not pending_rows:
+            write_products(PENDING_CSV, [])
+            return 0, 0
+
+        before = len(pending_rows)
+        filtered = [r for r in pending_rows if _key_of_row(r) not in src_keys]
+        removed = before - len(filtered)
+        write_products(PENDING_CSV, filtered)
+        return removed, len(filtered)
+
+
+# ========= USD→ILS HELPERS =========
+def _decode_csv_bytes(b: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1255", "iso-8859-8"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            continue
+    return b.decode("utf-8", errors="ignore")
+
+def _is_usd_price(raw_value: str) -> bool:
+    s = (raw_value or "")
+    if not isinstance(s, str):
+        s = str(s)
+    s_low = s.lower()
+    return ("$" in s) or ("usd" in s_low)
+
+def _extract_number(s: str) -> float | None:
+    if s is None:
+        return None
+    s = str(s)
+    m = re.search(r"([-+]?\d+(?:[.,]\d+)?)", s)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
+
+def _convert_price_text(raw_value: str, rate: float) -> str:
+    num = _extract_number(raw_value)
+    if num is None:
+        return ""
+    ils = round(num * rate)
+    return str(int(ils))
+
+def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
+    out = []
+    for r in rows_raw:
+        rr = dict(r)
+        if rate:
+            orig_src = rr.get("OriginalPrice", rr.get("Origin Price", ""))
+            sale_src = rr.get("SalePrice", rr.get("Discount Price", ""))
+
+            if _is_usd_price(str(orig_src)):
+                rr["OriginalPrice"] = _convert_price_text(orig_src, rate)
+            if _is_usd_price(str(sale_src)):
+                rr["SalePrice"] = _convert_price_text(sale_src, rate)
+        out.append(normalize_row_keys(rr))
+    return out
+
+
+# ========= INLINE MENU =========
+def inline_menu():
+    kb = types.InlineKeyboardMarkup(row_width=3)
+
+    # פעולות
+    
     kb.add(
-        types.InlineKeyboardButton("⬅️ הקודם", callback_data="queue_prev"),
-        types.InlineKeyboardButton("➡️ הבא", callback_data="queue_next"),
+        types.InlineKeyboardButton("📢 פרסם עכשיו", callback_data="publish_now"),
+        types.InlineKeyboardButton("⏱️ כל 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ כל 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ כל 30ד", callback_data="delay_1800"),
     )
-    kb.add(types.InlineKeyboardButton("🗑️ מחק פריט זה", callback_data="queue_del"))
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
+    kb.add(
+        types.InlineKeyboardButton("📊 סטטוס שידור", callback_data="pending_status"),
+        types.InlineKeyboardButton("🔄 טען/מזג מהקובץ", callback_data="reload_merge"),
+        types.InlineKeyboardButton("🕒 מצב שינה (החלפה)", callback_data="toggle_schedule"),
+    )
+
+    # מרווחים
+    kb.add(
+        types.InlineKeyboardButton("⏱️ דקה", callback_data="delay_60"),
+        types.InlineKeyboardButton("⏱️ 15ד", callback_data="delay_900"),
+        types.InlineKeyboardButton("⏱️ 20ד", callback_data="delay_1200"),
+        types.InlineKeyboardButton("⏱️ 25ד", callback_data="delay_1500"),
+        types.InlineKeyboardButton("⏱️ 30ד", callback_data="delay_1800"),
+    )
+
+    # העלאת CSV
+    kb.add(types.InlineKeyboardButton("📥 העלה CSV", callback_data="upload_source"))
+
+    # המרת $→₪ לקובץ הבא בלבד
+    kb.add(types.InlineKeyboardButton("₪ המרת $→₪ (3.55) לקובץ הבא", callback_data="convert_next"))
+
+    # איפוס יזום מהקובץ הראשי
+    kb.add(types.InlineKeyboardButton("🔁 חזור להתחלה מהקובץ", callback_data="reset_from_data"))
+
+    
+    kb.add(types.InlineKeyboardButton("⚙️ מצב אוטומטי (החלפה)", callback_data="toggle_auto_mode"))
+
+    # מחיקות
+    kb.add(
+        types.InlineKeyboardButton("🗑️ מחק פריטי התור מהקובץ", callback_data="delete_source_from_pending"),
+        types.InlineKeyboardButton("🧹 מחק את workfile.csv", callback_data="delete_source_file"),
+    )
+
+    # יעדים (שמורים)
+    kb.add(
+        types.InlineKeyboardButton("🎯 ציבורי (השתמש)", callback_data="target_public"),
+        types.InlineKeyboardButton("🔒 פרטי (השתמש)", callback_data="target_private"),
+    )
+    # בחירה דרך Forward
+    kb.add(
+        types.InlineKeyboardButton("🆕 בחר ערוץ ציבורי", callback_data="choose_public"),
+        types.InlineKeyboardButton("🆕 בחר ערוץ פרטי", callback_data="choose_private"),
+    )
+    # ביטול בחירה
+    kb.add(types.InlineKeyboardButton("❌ בטל בחירת יעד", callback_data="choose_cancel"))
+
+    kb.add(types.InlineKeyboardButton(
+        f"מרווח: ~{POST_DELAY_SECONDS//60} דק׳ | יעד: {CURRENT_TARGET}", callback_data="noop_info"
+    ))
     return kb
 
-def format_queue_item(i: int, total: int, row: Dict[str, Any]) -> str:
-    pid = row.get("ProductId") or ""
-    title = row.get("Title") or row.get("Product Desc") or ""
-    link = row.get("Promotion Url") or ""
-    return nfc(
-        f"פריט {i+1}/{total}\n"
-        f"ID: {pid}\n"
-        f"Title: {title[:120]}\n"
-        f"Link: {link}"
+
+# ========= INLINE CALLBACKS =========
+@bot.callback_query_handler(func=lambda c: True)
+def on_inline_click(c):
+    global POST_DELAY_SECONDS, CURRENT_TARGET
+    if not _is_admin(c.message):
+        bot.answer_callback_query(c.id, "אין הרשאה.", show_alert=True)
+        return
+
+    data = c.data or ""
+    chat_id = c.message.chat.id
+
+    if data == "publish_now":
+        ok = send_next_locked("manual")
+        if not ok:
+            bot.answer_callback_query(c.id, "אין פוסטים ממתינים או שגיאה בשליחה.", show_alert=True)
+            return
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "skip_one":
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+            if not pending:
+                bot.answer_callback_query(c.id, "אין מה לדלג – התור ריק.", show_alert=True)
+                return
+            write_products(PENDING_CSV, pending[1:])
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏭ דילגתי על הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "list_pending":
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            bot.answer_callback_query(c.id, "אין פוסטים ממתינים ✅", show_alert=True)
+            return
+        preview = pending[:10]
+        lines = []
+        for i, p in enumerate(preview, start=1):
+            title = str(p.get('Title',''))[:80]
+            sale = p.get('SalePrice','')
+            disc = p.get('Discount','')
+            rating = p.get('Rating','')
+            lines.append(f"{i}. {title}\n   מחיר מבצע: {sale} | הנחה: {disc} | דירוג: {rating}")
+        more = len(pending) - len(preview)
+        if more > 0:
+            lines.append(f"...ועוד {more} בהמתנה")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="📝 פוסטים ממתינים:\n\n" + "\n".join(lines),
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "pending_status":
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        count = len(pending)
+        now_il = datetime.now(tz=IL_TZ)
+        schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+        delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
+        target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
+        if count == 0:
+            text = f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅"
+        else:
+            total_seconds = (count - 1) * POST_DELAY_SECONDS
+            eta = now_il + timedelta(seconds=total_seconds)
+            eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
+            next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
+            status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
+            text = (
+                f"{schedule_line}\n"
+                f"{status_line}\n"
+                f"{delay_line}\n"
+                f"{target_line}\n"
+                f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+                f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
+                f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
+                f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
+            )
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=text, reply_markup=inline_menu(), parse_mode='HTML', cb_id=c.id)
+
+    elif data == "reload_merge":
+        added, already, total_after = merge_from_data_into_pending()
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🔄 מיזוג הושלם.\nנוספו: {added}\nבעבר בתור: {already}\nסה\"כ בתור כעת: {total_after}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "upload_source":
+        EXPECTING_UPLOAD.add(getattr(c.from_user, "id", None))
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text="שלח/י עכשיו קובץ CSV (כמסמך). הבוט ימפה עמודות, יעדכן workfile.csv וימזג אל התור.",
+            reply_markup=inline_menu(), cb_id=c.id
+        )
+
+    elif data == "toggle_schedule":
+        set_schedule_enforced(not is_schedule_enforced())
+        state = "🕰️ מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 תמיד-פעיל"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"החלפתי מצב לשידור: {state}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data.startswith("delay_"):
+        try:
+            seconds = int(data.split("_", 1)[1])
+            if seconds <= 0:
+                raise ValueError("מרווח חייב להיות חיובי")
+            POST_DELAY_SECONDS = seconds
+            save_delay_seconds(seconds)
+            DELAY_EVENT.set()
+            mins = seconds // 60
+            safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                              new_text=f"⏱️ עודכן מרווח: ~{mins} דק׳ ({seconds} שניות).",
+                              reply_markup=inline_menu(), cb_id=c.id)
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
+
+    elif data == "target_public":
+        v = _load_preset(PUBLIC_PRESET_FILE)
+        if v is None:
+            bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
+            return
+        CURRENT_TARGET = resolve_target(v)
+        ok, details = check_and_probe_target(CURRENT_TARGET)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🎯 עברתי לשדר ליעד הציבורי: {v}\n{details}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "target_private":
+        v = _load_preset(PRIVATE_PRESET_FILE)
+        if v is None:
+            bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
+            return
+        CURRENT_TARGET = resolve_target(v)
+        ok, details = check_and_probe_target(CURRENT_TARGET)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🔒 עברתי לשדר ליעד הפרטי: {v}\n{details}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "choose_public":
+        EXPECTING_TARGET[c.from_user.id] = "public"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **ציבורי** כדי לשמור אותו כיעד.\n\n"
+                                    "טיפ: פוסט בערוץ → ••• → Forward → בחר/י את הבוט."),
+                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+
+    elif data == "choose_private":
+        EXPECTING_TARGET[c.from_user.id] = "private"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=("שלח/י *Forward* של הודעה מאותו ערוץ **פרטי** כדי לשמור אותו כיעד.\n\n"
+                                    "חשוב: הוסף/י את הבוט כמנהל בערוץ הפרטי."),
+                          reply_markup=inline_menu(), parse_mode='Markdown', cb_id=c.id)
+
+    elif data == "choose_cancel":
+        EXPECTING_TARGET.pop(getattr(c.from_user, "id", None), None)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="ביטלתי את מצב בחירת היעד. אפשר להמשיך כרגיל.",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "convert_next":
+        try:
+            with open(CONVERT_NEXT_FLAG_FILE, "w", encoding="utf-8") as f:
+                f.write(str(USD_TO_ILS_RATE_DEFAULT))
+            safe_edit_message(
+                bot, chat_id=chat_id, message=c.message,
+                new_text=f"✅ הופעל: המרת מחירים מדולר לש\"ח בקובץ ה-CSV הבא בלבד (שער {USD_TO_ILS_RATE_DEFAULT}).",
+                reply_markup=inline_menu(), cb_id=c.id
+            )
+        except Exception as e:
+            bot.answer_callback_query(c.id, f"שגיאה בהפעלת המרה: {e}", show_alert=True)
+
+    elif data == "reset_from_data":
+        src = read_products(DATA_CSV)
+        with FILE_LOCK:
+            write_products(PENDING_CSV, src)
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"🔁 התור אופס ומתחיל מחדש ({len(src)} פריטים) מהקובץ הראשי.",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delete_source_from_pending":
+        removed, left = delete_source_rows_from_pending()
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=f"🗑️ הוסר מהתור: {removed} פריטים שנמצאו ב-workfile.csv\nנשארו בתור: {left}",
+            reply_markup=inline_menu(), cb_id=c.id
+        )
+
+
+    
+    elif data == "delay_1200":
+        POST_DELAY_SECONDS = 1200
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 20 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1500":
+        POST_DELAY_SECONDS = 1500
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 25 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+    elif data == "delay_1800":
+        POST_DELAY_SECONDS = 1800
+        save_delay_seconds(POST_DELAY_SECONDS)
+        DELAY_EVENT.set()
+        write_auto_flag("off")
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="⏱️ קצב שידור עודכן: כל 30 דקות (מצב ידני)",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "toggle_auto_mode":
+        current = read_auto_flag()
+        new_mode = "off" if current == "on" else "on"
+        write_auto_flag(new_mode)
+        new_label = "🟢 מצב אוטומטי פעיל" if new_mode == "on" else "🔴 מצב ידני בלבד"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"החלפתי מצב שידור: {new_label}",
+                          reply_markup=inline_menu(), cb_id=c.id)
+
+
+    elif data == "delete_source_file":
+        ok = delete_source_csv_file()
+        msg_txt = "🧹 workfile.csv אופס לריק (נשמרו רק כותרות). התור לא שונה." if ok else "שגיאה במחיקת workfile.csv"
+        safe_edit_message(
+            bot, chat_id=chat_id, message=c.message,
+            new_text=msg_txt, reply_markup=inline_menu(), cb_id=c.id
+        )
+
+    else:
+        bot.answer_callback_query(c.id)
+
+
+# ========= FORWARD HANDLER =========
+@bot.message_handler(
+    func=lambda m: EXPECTING_TARGET.get(getattr(m.from_user, "id", None)) is not None,
+    content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice']
+)
+def handle_forward_for_target(msg):
+    mode = EXPECTING_TARGET.get(getattr(msg.from_user, "id", None))
+    fwd = getattr(msg, "forward_from_chat", None)
+    if not fwd:
+        bot.reply_to(msg, "לא זיהיתי *הודעה מועברת מערוץ*. נסה/י שוב: העבר/י פוסט מהערוץ הרצוי.", parse_mode='Markdown')
+        return
+
+    chat_id = fwd.id
+    username = fwd.username or ""
+    target_value = f"@{username}" if username else chat_id
+
+    if mode == "public":
+        _save_preset(PUBLIC_PRESET_FILE, target_value)
+        label = "ציבורי"
+    else:
+        _save_preset(PRIVATE_PRESET_FILE, target_value)
+        label = "פרטי"
+
+    global CURRENT_TARGET
+    CURRENT_TARGET = resolve_target(target_value)
+    ok, details = check_and_probe_target(CURRENT_TARGET)
+
+    EXPECTING_TARGET.pop(msg.from_user.id, None)
+
+    bot.reply_to(msg,
+        f"✅ נשמר יעד {label}: {target_value}\n"
+        f"{details}\n\nאפשר לעבור בין יעדים מהתפריט: 🎯/🔒"
     )
 
-def send_queue_preview(chat_id: int):
-    q = read_queue()
-    if not q:
-        bot.send_message(chat_id, nfc("התור ריק"))
-        return
-    i = BROWSE_INDEX.get(chat_id, 0)
-    i = max(0, min(i, len(q)-1))
-    BROWSE_INDEX[chat_id] = i
-    row = q[i]
-    bot.send_message(chat_id, format_queue_item(i, len(q), row), reply_markup=make_queue_inline_kb())
 
-@bot.callback_query_handler(func=lambda c: c.data in ("queue_prev","queue_next","queue_del"))
-def on_queue_cb(c: types.CallbackQuery):
-    q = read_queue()
-    if not q:
-        bot.answer_callback_query(c.id, nfc("התור ריק"))
-        bot.edit_message_text(nfc("התור ריק"), chat_id=c.message.chat.id, message_id=c.message.message_id)
+# ========= UPLOAD CSV =========
+@bot.message_handler(commands=['upload_source'])
+def cmd_upload_source(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
         return
-    i = BROWSE_INDEX.get(c.message.chat.id, 0)
-    if c.data == "queue_prev":
-        i = max(0, i-1)
-        BROWSE_INDEX[c.message.chat.id] = i
-        bot.edit_message_text(
-            format_queue_item(i, len(q), q[i]),
-            chat_id=c.message.chat.id, message_id=c.message.message_id,
-            reply_markup=make_queue_inline_kb()
-        )
-        bot.answer_callback_query(c.id)
-    elif c.data == "queue_next":
-        i = min(len(q)-1, i+1)
-        BROWSE_INDEX[c.message.chat.id] = i
-        bot.edit_message_text(
-            format_queue_item(i, len(q), q[i]),
-            chat_id=c.message.chat.id, message_id=c.message.message_id,
-            reply_markup=make_queue_inline_kb()
-        )
-        bot.answer_callback_query(c.id)
-    elif c.data == "queue_del":
+    uid = getattr(msg.from_user, "id", None)
+    if uid is None:
+        bot.reply_to(msg, "שגיאה בזיהוי משתמש.")
+        return
+    EXPECTING_UPLOAD.add(uid)
+    bot.reply_to(msg,
+        "שלח/י עכשיו קובץ CSV (כמסמך). הבוט ימפה את העמודות אוטומטית, יעדכן את workfile.csv וימזג אל התור.\n"
+        "לא נוגעים בתזמונים, ולא מאפסים את התור."
+    )
+
+@bot.message_handler(content_types=['document'])
+def on_document(msg):
+    uid = getattr(msg.from_user, "id", None)
+    if uid not in EXPECTING_UPLOAD:
+        return
+
+    try:
+        doc = msg.document
+        filename = (doc.file_name or "").lower()
+        if not filename.endswith(".csv"):
+            bot.reply_to(msg, "זה לא נראה כמו CSV. נסה/י שוב עם קובץ .csv")
+            return
+
+        # הורדה
+        file_info = bot.get_file(doc.file_id)
+        file_bytes = bot.download_file(file_info.file_path)
+
+        csv_text = _decode_csv_bytes(file_bytes)
+
+        # קריאה RAW כדי לזהות $/USD לפני נורמליזציה
+        from io import StringIO
+        raw_reader = csv.DictReader(StringIO(csv_text))
+        rows_raw = [dict(r) for r in raw_reader]
+
+        # בדיקת דגל המרה לקובץ הבא
+        convert_rate = None
+        if os.path.exists(CONVERT_NEXT_FLAG_FILE):
+            try:
+                with open(CONVERT_NEXT_FLAG_FILE, "r", encoding="utf-8") as f:
+                    convert_rate = float((f.read() or "").strip() or USD_TO_ILS_RATE_DEFAULT)
+            except Exception:
+                convert_rate = USD_TO_ILS_RATE_DEFAULT
+            try:
+                os.remove(CONVERT_NEXT_FLAG_FILE)
+            except Exception:
+                pass
+
+        # המרה (אם נדרש) + נורמליזציה
+        rows = _rows_with_optional_usd_to_ils(rows_raw, convert_rate)
+
+        # כתיבה + מיזוג
         with FILE_LOCK:
-            q = read_queue()
-            if not q:
-                bot.answer_callback_query(c.id, nfc("התור ריק"))
-                return
-            i = BROWSE_INDEX.get(c.message.chat.id, 0)
-            i = max(0, min(i, len(q)-1))
-            removed = q.pop(i)
-            # שמור סדר שדות קיים
-            fieldnames = list(removed.keys()) if removed else (list(q[0].keys()) if q else None)
-            write_csv_rows(QUEUE_CSV, q, fieldnames=fieldnames)
-            # עדכון אינדקס תצוגה
-            if i >= len(q):
-                i = max(0, len(q)-1)
-            BROWSE_INDEX[c.message.chat.id] = i
-        if q:
-            bot.edit_message_text(
-                format_queue_item(i, len(q), q[i]),
-                chat_id=c.message.chat.id, message_id=c.message.message_id,
-                reply_markup=make_queue_inline_kb()
-            )
-        else:
-            bot.edit_message_text(nfc("התור ריק"), chat_id=c.message.chat.id, message_id=c.message.message_id)
-        bot.answer_callback_query(c.id, nfc("נמחק"))
+            write_products(DATA_CSV, rows)
+            # מיזוג ללא כפילויות
+            pending_rows = read_products(PENDING_CSV)
 
-# ========= לולאת שידור אוטומטי =========
-def poster_loop():
-    print(f"[{now_str()}] 🤖 Bot started with delay of {DEFAULT_DELAY_SEC} seconds", flush=True)
+            def key_of(r):
+                item_id = (r.get("ItemId") or "").strip()
+                title = (r.get("Title") or "").strip()
+                buy = (r.get("BuyLink") or "").strip()
+                return (item_id if item_id else None, title if not item_id else None, buy)
+
+            existing_keys = {key_of(r) for r in pending_rows}
+            added = 0
+            already = 0
+            for r in rows:
+                k = key_of(r)
+                if k in existing_keys:
+                    already += 1
+                    continue
+                pending_rows.append(r)
+                existing_keys.add(k)
+                added += 1
+            write_products(PENDING_CSV, pending_rows)
+            total_after = len(pending_rows)
+
+        extra_line = ""
+        if convert_rate:
+            extra_line = f"\n💱 בוצעה המרה לש\"ח בשער {convert_rate} לכל מחירי הדולר בקובץ זה."
+
+        bot.reply_to(msg,
+            "✅ הקובץ נקלט בהצלחה.\n"
+            f"נוספו לתור: {added}\nכבר היו בתור/כפולים: {already}\nסה\"כ בתור כעת: {total_after}"
+            + extra_line +
+            "\n\nהשידור ממשיך בקצב שנקבע. אפשר לבדוק '📊 סטטוס שידור' בתפריט."
+        )
+
+    except Exception as e:
+        bot.reply_to(msg, f"שגיאה בעיבוד הקובץ: {e}")
+    finally:
+        if uid in EXPECTING_UPLOAD:
+            EXPECTING_UPLOAD.remove(uid)
+
+
+# ========= TEXT COMMANDS =========
+@bot.message_handler(commands=['cancel'])
+def cmd_cancel(msg):
+    uid = getattr(msg.from_user, "id", None)
+    if uid is not None:
+        EXPECTING_TARGET.pop(uid, None)
+        EXPECTING_UPLOAD.discard(uid)
+    bot.reply_to(msg, "בוטל מצב בחירת יעד/העלאה. שלח /start לתפריט.")
+
+@bot.message_handler(commands=['list_pending'])
+def list_pending(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    preview = pending[:10]
+    lines = []
+    for i, p in enumerate(preview, start=1):
+        title = str(p.get('Title',''))[:80]
+        sale = p.get('SalePrice','')
+        disc = p.get('Discount','')
+        rating = p.get('Rating','')
+        lines.append(f"{i}. {title}\n   מחיר מבצע: {sale} | הנחה: {disc} | דירוג: {rating}")
+    more = len(pending) - len(preview)
+    if more > 0:
+        lines.append(f"...ועוד {more} בהמתנה")
+    bot.reply_to(msg, "פוסטים ממתינים:\n\n" + "\n".join(lines))
+
+@bot.message_handler(commands=['clear_pending'])
+def clear_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    with FILE_LOCK:
+        write_products(PENDING_CSV, [])
+    bot.reply_to(msg, "נוקה התור של הפוסטים הממתינים 🧹")
+
+@bot.message_handler(commands=['reset_pending'])
+def reset_pending(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    src = read_products(DATA_CSV)
+    with FILE_LOCK:
+        write_products(PENDING_CSV, src)
+    bot.reply_to(msg, "התור אופס מהקובץ הראשי והכול נטען מחדש 🔄")
+
+@bot.message_handler(commands=['skip_one'])
+def skip_one(msg):
+    if not _is_admin(msg):
+        bot.reply_to(msg, "אין הרשאה.")
+        return
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+        if not pending:
+            bot.reply_to(msg, "אין מה לדלג – אין פוסטים ממתינים.")
+            return
+        write_products(PENDING_CSV, pending[1:])
+    bot.reply_to(msg, "דילגתי על הפוסט הבא ✅")
+
+@bot.message_handler(commands=['peek_next'])
+def peek_next(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    nxt = pending[0]
+    txt = "<b>הפריט הבא בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in nxt.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['peek_idx'])
+def peek_idx(msg):
+    text = (msg.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.reply_to(msg, "שימוש: /peek_idx N  (לדוגמה: /peek_idx 3)")
+        return
+    idx = int(parts[1])
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    if not pending:
+        bot.reply_to(msg, "אין פוסטים ממתינים ✅")
+        return
+    if idx < 1 or idx > len(pending):
+        bot.reply_to(msg, f"אינדקס מחוץ לטווח. יש כרגע {len(pending)} פוסטים בתור.")
+        return
+    item = pending[idx-1]
+    txt = f"<b>פריט #{idx} בתור:</b>\n\n" + "\n".join([f"<b>{k}:</b> {v}" for k,v in item.items()])
+    bot.reply_to(msg, txt, parse_mode='HTML')
+
+@bot.message_handler(commands=['pending_status'])
+def pending_status(msg):
+    with FILE_LOCK:
+        pending = read_products(PENDING_CSV)
+    count = len(pending)
+    now_il = datetime.now(tz=IL_TZ)
+    schedule_line = "🕰️ מצב: מתוזמן (שינה פעיל)" if is_schedule_enforced() else "🟢 מצב: תמיד-פעיל"
+    delay_line = f"⏳ מרווח נוכחי: {POST_DELAY_SECONDS//60} דק׳ ({POST_DELAY_SECONDS} שניות)"
+    target_line = f"🎯 יעד נוכחי: {CURRENT_TARGET}"
+    if count == 0:
+        bot.reply_to(msg, f"{schedule_line}\n{delay_line}\n{target_line}\nאין פוסטים ממתינים ✅")
+        return
+    total_seconds = (count - 1) * POST_DELAY_SECONDS
+    eta = now_il + timedelta(seconds=total_seconds)
+    eta_str = eta.strftime("%Y-%m-%d %H:%M:%S %Z")
+    next_eta = now_il.strftime("%Y-%m-%d %H:%M:%S %Z")
+    status_line = "🎙️ שידור אפשרי עכשיו" if not is_quiet_now(now_il) else "⏸️ כרגע מחוץ לחלון השידור"
+    msg_text = (
+        f"{schedule_line}\n"
+        f"{status_line}\n"
+        f"{delay_line}\n"
+        f"{target_line}\n"
+        f"יש כרגע <b>{count}</b> פוסטים ממתינים.\n"
+        f"⏱️ השידור הבא (תיאוריה לפי מרווח): <b>{next_eta}</b>\n"
+        f"🕒 שעת השידור המשוערת של האחרון: <b>{eta_str}</b>\n"
+        f"(מרווח בין פוסטים: {POST_DELAY_SECONDS} שניות)"
+    )
+    bot.reply_to(msg, msg_text, parse_mode='HTML')
+
+
+# ========= HEALTH & START =========
+@bot.message_handler(commands=['ping'])
+def cmd_ping(msg):
+    bot.reply_to(msg, "pong ✅")
+
+@bot.message_handler(commands=['start', 'help', 'menu'])
+def cmd_start(msg):
+    try:
+        uid = getattr(msg.from_user, "id", None)
+        if uid is not None:
+            EXPECTING_TARGET.pop(uid, None)
+            EXPECTING_UPLOAD.discard(uid)
+    except Exception:
+        pass
+    print(f"Instance={socket.gethostname()} | User={msg.from_user.id if msg.from_user else 'N/A'} sent /start", flush=True)
+    bot.send_message(msg.chat.id, "בחר פעולה:", reply_markup=inline_menu())
+
+@bot.message_handler(func=lambda m: isinstance(m.text, str) and m.text.strip().lower() in ('/start', 'start'))
+def start_fallback(msg):
+    cmd_start(msg)
+
+
+# ========= SENDER LOOP =========
+
+def auto_post_loop():
+    if not os.path.exists(SCHEDULE_FLAG_FILE):
+        set_schedule_enforced(True)
+    init_pending()
+
     while True:
-        auto_on = (read_auto_flag() == "on") and read_state().get("auto", True)
-        if not auto_on:
-            # ידני
-            time.sleep(5)
+        if read_auto_flag() != "on":
+            print(f"[{datetime.now(tz=IL_TZ)}] מצב ידני – שינה 5 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=5)
+            DELAY_EVENT.clear()
             continue
+
         delay = get_auto_delay()
         if delay is None:
-            print(f"[{now_str()}] מחוץ לשעות שידור – שינה 60 שניות", flush=True)
+            print(f"[{datetime.now(tz=IL_TZ)}] מחוץ לשעות שידור – שינה 60 שניות", flush=True)
             DELAY_EVENT.wait(timeout=60)
             DELAY_EVENT.clear()
             continue
-        ok, info = post_next_from_queue()
-        print(f"[{now_str()}] Auto-post: {info}", flush=True)
-        DELAY_EVENT.wait(timeout=delay if ok else EMPTY_QUEUE_SLEEP)
+
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] התור ריק – שינה 30 שניות", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
+
+        send_next_locked("auto")
+        print(f"[{datetime.now(tz=IL_TZ)}] פורסם. המתנה {delay} שניות", flush=True)
+        DELAY_EVENT.wait(timeout=delay)
         DELAY_EVENT.clear()
 
-# ========= main =========
+    if not os.path.exists(SCHEDULE_FLAG_FILE):
+        set_schedule_enforced(True)
+    init_pending()
 
-# ========= Webhook / Polling selection =========
-USE_WEBHOOK = (os.environ.get("USE_WEBHOOK", "false").lower() in ("1","true","yes","on"))
-WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").rstrip("/")  # e.g., https://your-app.up.railway.app
-WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"  # unique path; secret header adds security
+    while True:
+        if is_quiet_now():
+            now_il = datetime.now(tz=IL_TZ)
+            print(f"[{now_il}] quiet hours ON – sleeping 30s", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
 
-if USE_WEBHOOK:
-    from flask import Flask, request, abort
-    app = Flask(__name__)
+        with FILE_LOCK:
+            pending = read_products(PENDING_CSV)
+        if not pending:
+            print(f"[{datetime.now(tz=IL_TZ)}] queue empty – sleeping 30s", flush=True)
+            DELAY_EVENT.wait(timeout=30)
+            DELAY_EVENT.clear()
+            continue
 
-    @app.route("/", methods=["GET"])
-    def root_ok():
-        return "OK", 200
+        send_next_locked("loop")
 
-    @app.route(WEBHOOK_PATH, methods=["POST"])
-    def telegram_webhook():
-        # Optional: verify Telegram secret header
-        if WEBHOOK_SECRET:
-            secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if secret_hdr != WEBHOOK_SECRET:
-                return abort(403)
-        try:
-            data = request.get_data().decode("utf-8")
-            update = telebot.types.Update.de_json(data)
-        except Exception:
-            return abort(400)
-        bot.process_new_updates([update])
-        return "OK", 200
+        print(f"[{datetime.now(tz=IL_TZ)}] sleeping for {POST_DELAY_SECONDS}s (or until delay changed)", flush=True)
+        DELAY_EVENT.wait(timeout=POST_DELAY_SECONDS)
+        DELAY_EVENT.clear()
 
 
-# ========= Dual-mode: Webhook if available, else Polling =========
-USE_WEBHOOK = (os.environ.get("USE_WEBHOOK", "false").lower() in ("1","true","yes","on"))
-WEBHOOK_BASE_URL = (os.environ.get("WEBHOOK_BASE_URL") or "").rstrip("/")
-WEBHOOK_SECRET = (os.environ.get("WEBHOOK_SECRET") or "").strip()
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-
-def run_webhook():
-    from flask import Flask, request, abort
-    app = Flask(__name__)
-
-    @app.route("/", methods=["GET"])
-    def root_ok():
-        return "OK", 200
-
-    @app.route("/healthz", methods=["GET"])
-    def healthz():
-        return "ok", 200
-
-    @app.route(WEBHOOK_PATH, methods=["POST"])
-    def telegram_webhook():
-        if WEBHOOK_SECRET:
-            secret_hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-            if secret_hdr != WEBHOOK_SECRET:
-                return abort(403)
-        try:
-            data = request.get_data().decode("utf-8")
-            update = telebot.types.Update.de_json(data)
-        except Exception:
-            return abort(400)
-        bot.process_new_updates([update])
-        return "OK", 200
-
+# ========= DEBUG LOG =========
+@bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'animation', 'audio', 'voice', 'sticker'])
+def _debug_log_everything(msg):
     try:
-        bot.delete_webhook(drop_pending_updates=True)
+        uid = getattr(msg.from_user, "id", None)
+        uname = f"@{msg.from_user.username}" if getattr(msg.from_user, "username", None) else uid
+        kind = (msg.content_type or "unknown")
+        txt = (msg.text or msg.caption or "")
+        txt = txt[:80].replace("\n", " ")
+        print(f"[DBG] inbound {kind} from {uname}: {txt}", flush=True)
     except Exception:
         pass
-    full_url = WEBHOOK_BASE_URL + WEBHOOK_PATH
-    bot.set_webhook(url=full_url, secret_token=(WEBHOOK_SECRET or None))
-    port = int(os.environ.get("PORT", "8080"))
-    print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {full_url}", flush=True)
-    from waitress import serve as _serve
-    _serve(app, host="0.0.0.0", port=port)
-
-def run_polling():
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=30)
-    except telebot.apihelper.ApiTelegramException as e:
-        print(f"[{now_str()}] Polling error: {e}", flush=True)
-        print(f"[{now_str()}] TIP: Use Webhook (set USE_WEBHOOK=true + WEBHOOK_BASE_URL) or ensure single instance.", flush=True)
 
 
-# ========= Start helpers (polling/webhook with auto-switch) =========
-def start_webhook():
-    base_url = (os.getenv("WEBHOOK_BASE_URL") or "").rstrip("/")
-    secret = os.getenv("WEBHOOK_SECRET", "hook")
-    port = int(os.getenv("PORT", "8080"))
-    if not base_url:
-        print(f"[{now_str()}] FATAL: WEBHOOK_BASE_URL is not set. Falling back to POLLING.", flush=True)
-        return False
-
-    path = f"/webhook/{BOT_TOKEN}"
-    listen = ("0.0.0.0", port)
-    try:
-        from flask import Flask, request, abort
-        app = Flask(__name__)
-
-        @app.route(path, methods=["POST"])
-        def tg_webhook():
-            if secret and request.headers.get("X-Telegram-Bot-Secret-Token") != secret:
-                abort(403)
-            update = request.stream.read().decode("utf-8")
-            bot.process_new_updates([types.Update.de_json(update)])
-            return "OK"
-
-        # Set webhook
-        bot.remove_webhook()
-        bot.set_webhook(url=base_url + path, secret_token=secret, drop_pending_updates=True)
-        print(f"[{now_str()}] Mode: WEBHOOK", flush=True)
-        print(f"[{now_str()}] 🌐 Webhook listening on :{port} at {base_url}{path}", flush=True)
-
-        # Production WSGI (waitress) if available
-        try:
-            from waitress import serve
-            serve(app, host=listen[0], port=listen[1])
-        except Exception:
-            app.run(host=listen[0], port=listen[1])
-        return True
-    except Exception as e:
-        print(f"[{now_str()}] Webhook start failed: {e}", flush=True)
-        return False
-
-
-def start_polling_with_auto_switch():
-    """
-    Start polling. If a 409 Conflict occurs and AUTO_SWITCH_WEBHOOK=true and WEBHOOK_BASE_URL configured,
-    automatically switch to webhook mode.
-    """
-    auto = (os.getenv("AUTO_SWITCH_WEBHOOK", "true").lower() in ("1","true","yes","on"))
-    base_url = (os.getenv("WEBHOOK_BASE_URL") or "").rstrip("/")
-    try:
-        print(f"[{now_str()}] Mode: POLLING", flush=True)
-        # Note: long_polling_timeout prevents frequent calls
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=30)
-    except _apihelper.ApiTelegramException as e:
-        if getattr(e, "error_code", None) == 409:
-            print(f"[{now_str()}] POLLING 409 Conflict detected.", flush=True)
-            if auto and base_url:
-                print(f"[{now_str()}] AUTO_SWITCH_WEBHOOK enabled and WEBHOOK_BASE_URL present → switching to WEBHOOK.", flush=True)
-                ok = start_webhook()
-                if ok:
-                    return
-                else:
-                    print(f"[{now_str()}] Webhook switch failed; re-trying polling in 15s.", flush=True)
-                    time.sleep(15)
-                    return start_polling_with_auto_switch()
-            else:
-                print(f"[{now_str()}] To auto-switch set AUTO_SWITCH_WEBHOOK=true and WEBHOOK_BASE_URL=https://...", flush=True)
-                raise
-        else:
-            print(f"[{now_str()}] Polling exception: {e}", flush=True)
-            raise
-    except Exception as e:
-        print(f"[{now_str()}] Polling crashed: {e}", flush=True)
-        raise
-def main():
-
-    # ---- Single-instance lock (same host) ----
-    try:
-        os.makedirs(os.path.dirname(RUN_LOCK_PATH), exist_ok=True)
-        global _RUN_LOCK_FH
-        if fcntl is None:
-            raise RuntimeError("fcntl not available")
-        _RUN_LOCK_FH = open(RUN_LOCK_PATH, "w")
-        fcntl.flock(_RUN_LOCK_FH.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _RUN_LOCK_FH.write(str(os.getpid()))
-        _RUN_LOCK_FH.flush()
-        print(f"[{now_str()}] Lock acquired: {RUN_LOCK_PATH}", flush=True)
-    except BlockingIOError:
-        print(f"[{now_str()}] Another instance already holds lock {RUN_LOCK_PATH}. Exiting.", flush=True)
-        raise SystemExit(1)
-    except Exception as e:
-        print(f"[{now_str()}] WARNING: lock setup failed: {e}. Continuing without single-instance guard.", flush=True)
-    t = threading.Thread(target=poster_loop, daemon=True)
-    t.start()
-    if USE_WEBHOOK and WEBHOOK_BASE_URL:
-        print(f"[{now_str()}] Mode: WEBHOOK", flush=True)
-        run_webhook()
-    else:
-        if USE_WEBHOOK and not WEBHOOK_BASE_URL:
-            print(f"[{now_str()}] USE_WEBHOOK set but WEBHOOK_BASE_URL missing → falling back to POLLING.", flush=True)
-        else:
-            print(f"[{now_str()}] Mode: POLLING", flush=True)
-        run_polling()
-
+# ========= MAIN =========
 if __name__ == "__main__":
-    main()
+    print(f"Instance: {socket.gethostname()}", flush=True)
+    try:
+        me = bot.get_me()
+        print(f"Bot: @{me.username} ({me.id})", flush=True)
+    except Exception as e:
+        print("getMe failed:", e, flush=True)
+
+    _lock_handle = acquire_single_instance_lock(LOCK_PATH)
+    if _lock_handle is None:
+        print("Another instance is running (lock failed). Exiting.", flush=True)
+        sys.exit(1)
+
+    print_webhook_info()
+    try:
+        force_delete_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        try:
+            bot.remove_webhook()
+        except Exception as e2:
+            print(f"[WARN] remove_webhook failed: {e2}", flush=True)
+    print_webhook_info()
+
+    t = threading.Thread(target=auto_post_loop, daemon=True)
+    t.start()
+
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            msg = str(e)
+            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
+            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
+            time.sleep(wait)
+
+
+@bot.message_handler(commands=['toggle_mode'])
+def toggle_mode(msg):
+    if not _is_admin(msg):
+        return
+    mode = read_auto_flag()
+    new_mode = "off" if mode == "on" else "on"
+    write_auto_flag(new_mode)
+    bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
+
+# ==============================
+# פונקציה לספירת מוצרים בתור
+def count_pending_queue():
+    queue_path = os.path.join(BASE_DIR, "queue.csv")
+    if not os.path.exists(queue_path):
+        return 0
+    with open(queue_path, "r", encoding="utf-8-sig") as f:
+        return sum(1 for line in f) - 1  # ללא שורת כותרת
+
+
+# ==============================
+# פעולה לשאיבת מוצרים לפי קטגוריה
+def handle_category_fetch(message, category_id, name):
+    if is_bot_locked():
+        bot.reply_to(message, "⚠️ הבוט כבוי כרגע. הפעל אותו תחילה.")
+        return
+    try:
+        added = fetch_products_by_category(category_id)
+        count = count_pending_queue()
+        bot.reply_to(message, f"✅ נוספו {added} מוצרים לקטגוריה {name}.
+📦 כעת יש בתור: {count} פריטים.")
+    except Exception as e:
+        bot.reply_to(message, f"שגיאה בשאיבה: {e}")
+
+
+# ==============================
+# תפריט כפתורים ראשי
+@bot.message_handler(commands=["start", "menu"])
+def show_main_menu(message):
+    if is_bot_locked():
+        status = "🔴 כבוי"
+    else:
+        status = "🟢 פעיל"
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add("🔁 שאיבת מוצרים", "📦 מצב תור")
+    markup.add("🛑 הפעל/כבה את הבוט", f"⚙️ מצב נוכחי: {status}")
+    bot.send_message(message.chat.id, "בחר פעולה מהתפריט:", reply_markup=markup)
+
+
+# ==============================
+# תפריט קטגוריות לשאיבה
+@bot.message_handler(func=lambda m: m.text == "🔁 שאיבת מוצרים")
+def show_fetch_categories(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(
+        types.InlineKeyboardButton("🪔 תאורה", callback_data="fetch_cat_100003109"),
+        types.InlineKeyboardButton("🧸 ילדים", callback_data="fetch_cat_1501"),
+        types.InlineKeyboardButton("💻 גאדג'טים", callback_data="fetch_cat_5090301"),
+        types.InlineKeyboardButton("👕 בגדים", callback_data="fetch_cat_200003482"),
+        types.InlineKeyboardButton("🛠 כלי עבודה", callback_data="fetch_cat_3227")
+    )
+    bot.send_message(message.chat.id, "בחר קטגוריה לשאיבה:", reply_markup=markup)
+
+
+# ==============================
+# הפעלת כיבוי/הפעלה
+@bot.message_handler(func=lambda m: m.text == "🛑 הפעל/כבה את הבוט")
+def toggle_lock(message):
+    now_locked = toggle_bot_lock()
+    status = "🔴 הבוט כעת כבוי." if now_locked else "🟢 הבוט כעת פעיל!"
+    bot.send_message(message.chat.id, status)
+
+
+# ==============================
+# מצב תור
+@bot.message_handler(func=lambda m: m.text == "📦 מצב תור")
+def queue_status(message):
+    count = count_pending_queue()
+    bot.send_message(message.chat.id, f"📦 כמות פריטים ממתינים בתור: {count}")
+
+
+# ==============================
+# לחיצות אינליין של קטגוריות
+@bot.callback_query_handler(func=lambda call: call.data.startswith("fetch_cat_"))
+def handle_fetch_callback(call):
+    if is_bot_locked():
+        bot.answer_callback_query(call.id, "הבוט כבוי כרגע")
+        return
+    category_id = call.data.replace("fetch_cat_", "")
+    name_map = {
+        "100003109": "תאורה",
+        "1501": "ילדים",
+        "5090301": "גאדג'טים",
+        "200003482": "בגדים",
+        "3227": "כלי עבודה"
+    }
+    name = name_map.get(category_id, "מוצרים")
+    handle_category_fetch(call.message, category_id, name)
+
+
+# ==============================
+# שאיבה אוטומטית כל 6 שעות
+AUTO_FETCH_FLAG = os.path.join(BASE_DIR, "auto_fetch.flag")
+CATEGORIES = [
+    ("100003109", "תאורה"),
+    ("1501", "ילדים"),
+    ("5090301", "גאדג'טים"),
+    ("200003482", "בגדים"),
+    ("3227", "כלי עבודה")
+]
+
+def is_auto_fetch_enabled():
+    return os.path.exists(AUTO_FETCH_FLAG)
+
+def toggle_auto_fetch():
+    if is_auto_fetch_enabled():
+        os.remove(AUTO_FETCH_FLAG)
+        return False
+    else:
+        with open(AUTO_FETCH_FLAG, "w") as f:
+            f.write("on")
+        return True
+
+def auto_fetch_loop():
+    while True:
+        if is_auto_fetch_enabled() and not is_bot_locked():
+            cat_id, name = random.choice(CATEGORIES)
+            try:
+                added = fetch_products_by_category(cat_id)
+                print(f"[AUTO] נוספו {added} מוצרים ({name}) לתור")
+            except Exception as e:
+                print(f"[AUTO] שגיאה בשאיבה: {e}")
+        time.sleep(6 * 60 * 60)  # כל 6 שעות
+
+auto_thread = threading.Thread(target=auto_fetch_loop, daemon=True)
+auto_thread.start()
+
+
+# ==============================
+# מחיקת פריט מהתור אחרי פרסום
+def remove_first_from_queue_and_archive():
+    queue_file = os.path.join(BASE_DIR, "queue.csv")
+    archive_file = os.path.join(BASE_DIR, "archive.csv")
+    if not os.path.exists(queue_file):
+        return
+
+    with open(queue_file, "r", encoding="utf-8-sig") as f:
+        lines = f.readlines()
+    if len(lines) <= 1:
+        return
+
+    first = lines[1]
+    with open(archive_file, "a", encoding="utf-8-sig") as a:
+        a.write(first)
+
+    with open(queue_file, "w", encoding="utf-8-sig") as f:
+        f.writelines([lines[0]] + lines[2:])  # שומר כותרת, מדלג על הראשון
+
+
+# ==============================
+# תפריט הפעלת שאיבה אוטומטית
+@bot.message_handler(func=lambda m: m.text == "⚙️ מצב נוכחי: 🟢 פעיל" or m.text == "⚙️ מצב נוכחי: 🔴 כבוי")
+def toggle_auto_fetch_button(message):
+    now_enabled = toggle_auto_fetch()
+    status = "🟢 מופעל" if now_enabled else "🔴 כבוי"
+    bot.send_message(message.chat.id, f"מצב שאיבה אוטומטית כעת: {status}")
+
+
+# ==============================
+# עיון בתור לפי עמודים
+from math import ceil
+
+PAGE_SIZE = 5
+queue_pages = {}
+
+@bot.message_handler(func=lambda m: m.text == "📋 עיון בתור")
+def view_queue_start(message):
+    user_id = message.chat.id
+    queue_pages[user_id] = 0
+    send_queue_page(user_id, 0)
+
+def send_queue_page(user_id, page):
+    path = os.path.join(BASE_DIR, "queue.csv")
+    if not os.path.exists(path):
+        bot.send_message(user_id, "התור ריק.")
+        return
+
+    with open(path, "r", encoding="utf-8-sig") as f:
+        lines = f.readlines()[1:]
+
+    total = len(lines)
+    if total == 0:
+        bot.send_message(user_id, "אין פריטים בתור.")
+        return
+
+    pages = ceil(total / PAGE_SIZE)
+    start = page * PAGE_SIZE
+    end = start + PAGE_SIZE
+    chunk = lines[start:end]
+
+    text = f"📋 עמוד {page+1}/{pages}\n\n"
+    for i, line in enumerate(chunk):
+        parts = line.split(",")
+        if len(parts) >= 2:
+            text += f"{start+i+1}. {parts[1]}\n"
+
+    nav = types.InlineKeyboardMarkup()
+    btns = []
+    if page > 0:
+        btns.append(types.InlineKeyboardButton("⏮ הקודם", callback_data=f"qprev_{page-1}"))
+    if end < total:
+        btns.append(types.InlineKeyboardButton("⏭ הבא", callback_data=f"qnext_{page+1}"))
+    nav.row(*btns)
+    bot.send_message(user_id, text, reply_markup=nav)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("qprev_") or call.data.startswith("qnext_"))
+def navigate_queue(call):
+    new_page = int(call.data.split("_")[1])
+    queue_pages[call.message.chat.id] = new_page
+    send_queue_page(call.message.chat.id, new_page)
