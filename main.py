@@ -207,6 +207,25 @@ def read_products(path):
         return rows
 
 def write_products(path, rows):
+    """Write list[dict] rows to CSV with stable schema used by the bot."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    # Preferred column order for the bot; extras will be appended
+    preferred = [
+        'ItemId','ImageURL','Video Url','Title','Product Desc',
+        'OriginalPrice','SalePrice','Discount','Rating','Orders',
+        'BuyLink','CouponCode','Opening','Strengths'
+    ]
+    # Collect union of keys
+    all_keys = set()
+    for r in rows or []:
+        if isinstance(r, dict):
+            all_keys.update(r.keys())
+    fieldnames = preferred + sorted(k for k in all_keys if k not in preferred)
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in rows or []:
+            writer.writerow(r)
 
 
 # ---- AliExpress helpers ----
@@ -1307,10 +1326,11 @@ def auto_post_loop():
 
     while True:
         if is_bot_locked():
-            print(f"[{}] הבוט כבוי – שינה 5 שניות".format(datetime.now(tz=IL_TZ)), flush=True)
+            print(f"[{datetime.now(tz=IL_TZ)}] הבוט כבוי – שינה 5 שניות", flush=True)
             DELAY_EVENT.wait(timeout=5)
             DELAY_EVENT.clear()
-            continueif read_auto_flag() != "on":
+            continue
+        if read_auto_flag() != "on":
             print(f"[{datetime.now(tz=IL_TZ)}] מצב ידני – שינה 5 שניות", flush=True)
             DELAY_EVENT.wait(timeout=5)
             DELAY_EVENT.clear()
