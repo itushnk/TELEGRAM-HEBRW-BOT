@@ -5,10 +5,12 @@ import os, time, json, hashlib, requests
 from datetime import datetime
 
 GATEWAY = os.getenv("AE_GATEWAY_URL", "https://gw.api.taobao.com/router/rest")
-APP_KEY = os.getenv("AE_APP_KEY", "")
-APP_SECRET = os.getenv("AE_APP_SECRET", "")
+APP_KEY = os.getenv("AE_APP_KEY") or os.getenv("AE_API_APP_KEY") or ""
+APP_SECRET = os.getenv("AE_APP_SECRET") or os.getenv("AE_API_APP_SECRET") or ""
 TRACKING_ID = os.getenv("AE_TRACKING_ID", "")
 TIMEOUT = int(os.getenv("AE_API_TIMEOUT", "25"))
+
+print(f"[AE][ENV] KEY={'OK' if APP_KEY else 'MISSING'} | SECRET={'OK' if APP_SECRET else 'MISSING'}", flush=True)
 
 def _timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
