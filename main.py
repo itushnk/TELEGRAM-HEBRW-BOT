@@ -1644,3 +1644,34 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+if __name__ == '__main__':
+    print('[BOOT] Keepalive loop running (__main__)', flush=True)
+    while True:
+        time.sleep(300)
+
+# --- Forced keepalive & polling at import time (so process never exits) ---
+try:
+    __FORCED_KEEPALIVE__
+except NameError:
+    __FORCED_KEEPALIVE__ = False
+if not __FORCED_KEEPALIVE__:
+    try:
+        def __poll_forever():
+            while True:
+                try:
+                    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                except Exception as e:
+                    print(f"[POLL] {e} — retry in 3s", flush=True)
+                    time.sleep(3)
+        th = threading.Thread(target=__poll_forever, daemon=True)
+        th.start()
+        print('[BOOT] Forced polling thread started', flush=True)
+    except Exception as e:
+        print(f"[BOOT] Failed to start polling thread: {e}", flush=True)
+    __FORCED_KEEPALIVE__ = True
+    # Non-daemon sleep to prevent process exit
+    try:
+        while True:
+            time.sleep(300)
+    except KeyboardInterrupt:
+        pass
