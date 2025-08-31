@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 import socket
 import re
 
+
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -48,12 +49,6 @@ else:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(f'pid={os.getpid()}\n')
     print(f"[INIT] Acquired instance lock at {RUN_LOCK_PATH}", flush=True)
-
-
-# ========= CONFIG =========
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
-CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
-ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
 DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
@@ -805,7 +800,7 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 
-def do_ae_pull(cat: str, chat_id: int, cb_id: str | None = None):
+def do_ae_pull(cat: str, chat_id: int | None = None, cb_id: str | None = None):
     """Shared AliExpress pull routine for both callback and text flows."""
     try:
         if cb_id:
@@ -820,10 +815,10 @@ def do_ae_pull(cat: str, chat_id: int, cb_id: str | None = None):
             pending_count = len(read_products(PENDING_CSV))
         msg = f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}"
         try:
-            bot.send_message(chat_id, msg, reply_markup=inline_menu())
+            bot.send_message(chat_id, msg, reply_markup=inline_menu()) if chat_id is not None else None
         except Exception:
             # Fallback
-            bot.send_message(chat_id, msg)
+            bot.send_message(chat_id, msg) if chat_id is not None else None
         return True
     except Exception as e:
         emsg = str(e)
@@ -834,51 +829,10 @@ def do_ae_pull(cat: str, chat_id: int, cb_id: str | None = None):
             except Exception:
                 pass
         try:
-            bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:180]}")
+            bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:180]}") if chat_id is not None else None
         except Exception:
             pass
         return False
-
-
-def do_ae_pull_async(cat: str, chat_id: int, cb_id: str | None = None):
-    """Run AliExpress pull in a background thread and respond quickly to Telegram callback."""
-    try:
-        if cb_id:
-            try:
-                bot.answer_callback_query(cb_id, "⏳ מתחיל לשאוב…", show_alert=False)
-            except Exception:
-                pass
-        try:
-            bot.send_message(chat_id, "⏳ מתחיל לשאוב… זה עשוי לקחת כמה שניות.")
-        except Exception:
-            pass
-
-        def _worker():
-            try:
-                prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country="IL")
-                rows = [normalize_ae_product(p) for p in prods]
-                append_to_pending(rows)
-                with FILE_LOCK:
-                    pending_count = len(read_products(PENDING_CSV))
-                msg = f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}"
-                try:
-                    bot.send_message(chat_id, msg, reply_markup=inline_menu())
-                except Exception:
-                    bot.send_message(chat_id, msg)
-            except Exception as e:
-                emsg = str(e)
-                print(f"[AE][ERR] {emsg}", flush=True)
-                tip = ""
-                if "Timeout" in emsg or "timed out" in emsg:
-                    tip = "\n↪️ ניתן להגדיר AE_GATEWAY_LIST=https://eco.taobao.com/router/rest או פרוקסי ב-AE_HTTPS_PROXY"
-                try:
-                    bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:300]}{tip}")
-                except Exception:
-                    pass
-
-        threading.Thread(target=_worker, daemon=True).start()
-    except Exception as e:
-        print(f"[AE][ERR-async] {e}", flush=True)
 
 def on_inline_click(c):
     data = getattr(c, 'data', '') or ''
@@ -925,9 +879,6 @@ def on_inline_click(c):
             except Exception:
                 pass
             return
-        cat = data.split("_", 2)[2]
-        do_ae_pull_async(cat=cat, chat_id=chat_id, cb_id=c.id)
-        return
         cat = data.split("_", 2)[2]
         do_ae_pull(cat=cat, chat_id=chat_id, cb_id=c.id)
         return
