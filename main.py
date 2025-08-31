@@ -1600,6 +1600,15 @@ if __name__ == "__main__":
 
 # --- Basic /start and /menu handlers ---
 @bot.message_handler(commands=['start', 'menu'])
+
+
+@bot.message_handler(commands=['ping'])
+def _cmd_ping(m):
+    try:
+        bot.reply_to(m, "pong ✅")
+    except Exception:
+        pass
+
 def _cmd_start_menu(m):
     try:
         km = inline_menu() if 'inline_menu' in globals() else None
@@ -1611,14 +1620,20 @@ def _cmd_start_menu(m):
     except Exception:
         bot.reply_to(m, msg)
 
-while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-        except Exception as e:
-            msg = str(e)
-            wait = 30 if "Conflict: terminated by other getUpdates request" in msg else 5
-            print(f"[{datetime.now(tz=IL_TZ).strftime('%Y-%m-%d %H:%M:%S %Z')}] Polling error: {e}. Retrying in {wait}s...", flush=True)
-            time.sleep(wait)
+try:
+    __POLL_STARTED
+except NameError:
+    __POLL_STARTED = False
+if not __POLL_STARTED:
+    def __run_polling():
+        while True:
+            try:
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+            except Exception as e:
+                print(f"[POLL] {e} — retry in 3s", flush=True)
+                time.sleep(3)
+    threading.Thread(target=__run_polling, daemon=True).start()
+    __POLL_STARTED = True
 
 
 @bot.message_handler(commands=['toggle_mode'])
