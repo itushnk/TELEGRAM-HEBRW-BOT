@@ -76,15 +76,6 @@ USD_TO_ILS_RATE_DEFAULT = 3.55
 # נעילה למופע יחיד
 LOCK_PATH = os.environ.get("BOT_LOCK_PATH", os.path.join(BASE_DIR, "bot.lock"))
 
-# Remove bot lock on start if requested (to avoid stuck 'bot off')
-if os.getenv('CLEAR_BOT_LOCK_ON_START') == '1':
-    try:
-        if os.path.exists(LOCK_PATH):
-            os.remove(LOCK_PATH)
-            print(f"[BOOT] Cleared {LOCK_PATH}", flush=True)
-    except Exception:
-        pass
-
 # --- Global bot ON/OFF ---
 def is_bot_locked() -> bool:
     try:
@@ -111,8 +102,6 @@ if not BOT_TOKEN:
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-
-# --- Start Telegram polling in a background thread (so the main loop won't block) ---
 try:
     # Ensure webhook is disabled and drop any backlog to reduce 409 noise
     bot.delete_webhook(drop_pending_updates=True)
@@ -590,12 +579,6 @@ def write_auto_flag(value):
         f.write(value)
 
 def get_auto_delay():
-    # Override to force bot 'always on' via ENV
-    if os.getenv('BOT_ALWAYS_ON') == '1':
-        try:
-            return max(1, int(os.getenv('POST_DELAY_SECONDS', '5')))
-        except Exception:
-            return 5
     now = datetime.now(IL_TZ).time()
     for start, end, delay in AUTO_SCHEDULE:
         if start <= now <= end:
@@ -745,26 +728,6 @@ def _rows_with_optional_usd_to_ils(rows_raw: list[dict], rate: float | None):
 
 
 # ========= INLINE MENU =========
-
-
-@bot.message_handler(commands=['health'])
-def _cmd_health(m):
-    try:
-        pending = 0
-        try:
-            with FILE_LOCK:
-                pending = len(read_products(PENDING_CSV))
-        except Exception:
-            pass
-        flags = [
-            f"lock={'ON' if os.path.exists(LOCK_PATH) else 'OFF'}",
-            f"always_on={os.getenv('BOT_ALWAYS_ON','0')}",
-            f"gw_list={(os.getenv('AE_GATEWAY_LIST') or 'default').split(',')[0]}",
-        ]
-        bot.reply_to(m, f"Health OK\nPending={pending}\n" + ' | '.join(flags))
-    except Exception as e:
-        bot.reply_to(m, f"Health err: {e}")
-
 @bot.message_handler(commands=['start','menu'])
 def _show_menu(message):
     try:
@@ -1657,6 +1620,20 @@ def _cmd_start_menu(m):
     except Exception:
         bot.reply_to(m, msg)
 
+try:
+    __POLL_STARTED
+except NameError:
+    __POLL_STARTED = False
+if not __POLL_STARTED:
+    def __run_polling():
+        while True:
+            try:
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+            except Exception as e:
+                print(f"[POLL] {e} — retry in 3s", flush=True)
+                time.sleep(3)
+    threading.Thread(target=__run_polling, daemon=True).start()
+    __POLL_STARTED = True
 
 
 @bot.message_handler(commands=['toggle_mode'])
@@ -1667,24 +1644,40 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
-
-if __name__ == '__main__':
-    # Ensure polling is active
+@bot.callback_query_handler(func=lambda c: True)
+def __cb_router(c):
     try:
-        __POLL_STARTED
-    except NameError:
-        __POLL_STARTED = False
-    if not __POLL_STARTED:
-        def __run_polling():
-            while True:
+        data = getattr(c, 'data', '') or ''
+        uid = getattr(getattr(c, 'from_user', None), 'id', None)
+        print(f"[DBG] callback from {uid}: {data[:80]} (len={len(data)})", flush=True)
+        if 'on_inline_click' in globals() and callable(on_inline_click):
+            return on_inline_click(c)
+        if data == 'bot_toggle':
+            try:
+                toggle_bot_lock(c.message.chat.id if c.message else uid)
+                bot.answer_callback_query(c.id, "בוצע.", show_alert=False)
+            except Exception:
+                pass
+            return
+        if data.startswith('ae_cat_'):
+            cat = data.split('_', 2)[2]
+            try:
+                if 'do_ae_pull_async' in globals():
+                    do_ae_pull_async(cat=cat, chat_id=(c.message.chat.id if c.message else uid), cb_id=c.id)
+                elif 'do_ae_pull' in globals():
+                    do_ae_pull(cat=cat, chat_id=(c.message.chat.id if c.message else uid), cb_id=c.id)
+                else:
+                    bot.answer_callback_query(c.id, "לא נמצא מטפל לשאיבה.", show_alert=True)
+            except Exception as e:
                 try:
-                    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-                except Exception as e:
-                    print(f"[POLL] {e} — retry in 3s", flush=True)
-                    time.sleep(3)
-        t = threading.Thread(target=__run_polling, daemon=False)
-        t.start()
-        __POLL_STARTED = True
-    print('[BOOT] Keepalive loop running', flush=True)
-    while True:
-        time.sleep(300)
+                    bot.answer_callback_query(c.id, f"שגיאה: {str(e)[:120]}", show_alert=True)
+                except Exception:
+                    pass
+            return
+        try:
+            bot.answer_callback_query(c.id, "👌", show_alert=False)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[DBG] router err: {e}", flush=True)
+
