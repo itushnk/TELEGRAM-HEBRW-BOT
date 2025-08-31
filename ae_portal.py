@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 # AliExpress Open Platform (Portal) Gateway adapter — TOP protocol (MD5 signature)
 import os, time, json, hashlib, requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime
 
 GATEWAY = os.getenv("AE_GATEWAY_URL", "https://gw.api.taobao.com/router/rest")
@@ -40,7 +42,7 @@ def _call(method: str, biz_params: dict) -> dict:
     payload["sign"] = _sign(payload, APP_SECRET)
 
     try:
-        r = requests.post(GATEWAY, data=payload, timeout=TIMEOUT)
+        r = sess.post(GATEWAY, data=payload, timeout=(float(os.getenv('AE_CONNECT_TIMEOUT','15')), float(os.getenv('AE_READ_TIMEOUT','25'))))
         r.raise_for_status()
         data = r.json()
     except ValueError:
@@ -109,3 +111,27 @@ def affiliate_product_query_by_category(category_id: str, page_no=1, page_size=1
     if not prods:
         raise RuntimeError(f"לא נמצאו מוצרים ב־Gateway (method={method})")
     return prods
+
+
+def _make_session():
+    s = requests.Session()
+    # Retries with backoff
+    total = int(os.getenv("AE_RETRY_TOTAL", "3"))
+    backoff = float(os.getenv("AE_RETRY_BACKOFF", "1.5"))
+    status = [int(x) for x in (os.getenv("AE_RETRY_STATUS", "429,500,502,503,504").split(",")) if x.strip().isdigit()]
+    retry = Retry(total=total, connect=total, read=total, backoff_factor=backoff,
+                  status_forcelist=status, allowed_methods=frozenset(["GET","POST"]))
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+
+    # Proxies (prefer AE_* then standard env)
+    http_proxy = os.getenv("AE_HTTP_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
+    https_proxy = os.getenv("AE_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or http_proxy
+    proxies = {}
+    if http_proxy: proxies["http"] = http_proxy
+    if https_proxy: proxies["https"] = https_proxy
+    if proxies:
+        s.proxies.update(proxies)
+        print(f"[AE][PROXY] Using proxies: http={'ON' if 'http' in proxies else 'OFF'} https={'ON' if 'https' in proxies else 'OFF'}", flush=True)
+    return s

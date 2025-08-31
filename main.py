@@ -861,7 +861,7 @@ def on_inline_click(c):
             msg = str(e)
             print(f"[AE][ERR] {msg}", flush=True)
             try:
-                bot.answer_callback_query(c.id, f"שגיאה בשאיבה: {msg[:180]}", show_alert=True)
+                bot.answer_callback_query(c.id, f"שגיאה בשאיבה: {msg[:160]}\n↪️ ניתן להגדיר פרוקסי ב-AE_HTTP_PROXY/AE_HTTPS_PROXY", show_alert=True)
             except Exception:
                 pass
         return
