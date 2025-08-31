@@ -40,6 +40,7 @@ def _call(method: str, biz_params: dict) -> dict:
     flat = {k: ("" if v is None else v) for k, v in biz_params.items()}
     payload = {**p, **flat}
     payload["sign"] = _sign(payload, APP_SECRET)
+    sess = _make_session()
 
     try:
         r = sess.post(GATEWAY, data=payload, timeout=(float(os.getenv('AE_CONNECT_TIMEOUT','15')), float(os.getenv('AE_READ_TIMEOUT','25'))))
