@@ -103,6 +103,21 @@ if not BOT_TOKEN:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 try:
+    __POLL_STARTED
+except NameError:
+    __POLL_STARTED = False
+if not __POLL_STARTED:
+    import threading, time
+    def __run_polling():
+        while True:
+            try:
+                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+            except Exception as e:
+                print(f"[POLL] {e} — retry in 3s", flush=True)
+                time.sleep(3)
+    threading.Thread(target=__run_polling, daemon=True).start()
+    __POLL_STARTED = True
+try:
     # Ensure webhook is disabled and drop any backlog to reduce 409 noise
     bot.delete_webhook(drop_pending_updates=True)
 except TypeError:
@@ -1620,22 +1635,6 @@ def _cmd_start_menu(m):
     except Exception:
         bot.reply_to(m, msg)
 
-try:
-    __POLL_STARTED
-except NameError:
-    __POLL_STARTED = False
-if not __POLL_STARTED:
-    def __run_polling():
-        while True:
-            try:
-                bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-            except Exception as e:
-                print(f"[POLL] {e} — retry in 3s", flush=True)
-                time.sleep(3)
-    threading.Thread(target=__run_polling, daemon=True).start()
-    __POLL_STARTED = True
-
-
 @bot.message_handler(commands=['toggle_mode'])
 def toggle_mode(msg):
     if not _is_admin(msg):
@@ -1644,34 +1643,16 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
 if __name__ == '__main__':
-    print('[BOOT] Keepalive loop running (__main__)', flush=True)
+    # Auto-unlock unless explicitly start-locked
+    try:
+        if os.getenv('BOT_START_LOCKED','0') != '1' and os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+            print(f"[BOOT] Auto-cleared {LOCK_PATH}", flush=True)
+    except Exception as _e:
+        print(f"[BOOT] Could not clear {LOCK_PATH}: {_e}", flush=True)
+    print('[BOOT] Keepalive loop running', flush=True)
+    import time
     while True:
         time.sleep(300)
-
-# --- Forced keepalive & polling at import time (so process never exits) ---
-try:
-    __FORCED_KEEPALIVE__
-except NameError:
-    __FORCED_KEEPALIVE__ = False
-if not __FORCED_KEEPALIVE__:
-    try:
-        def __poll_forever():
-            while True:
-                try:
-                    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
-                except Exception as e:
-                    print(f"[POLL] {e} — retry in 3s", flush=True)
-                    time.sleep(3)
-        th = threading.Thread(target=__poll_forever, daemon=True)
-        th.start()
-        print('[BOOT] Forced polling thread started', flush=True)
-    except Exception as e:
-        print(f"[BOOT] Failed to start polling thread: {e}", flush=True)
-    __FORCED_KEEPALIVE__ = True
-    # Non-daemon sleep to prevent process exit
-    try:
-        while True:
-            time.sleep(300)
-    except KeyboardInterrupt:
-        pass
