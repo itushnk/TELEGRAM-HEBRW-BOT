@@ -1,3 +1,4 @@
+import os
 
 
 # --- Single instance lock to avoid 409 conflicts ---
@@ -46,6 +47,9 @@ except FileExistsError:
     import sys; sys.exit(0)
 except Exception as e:
     print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
+
+
+# --- Single instance lock to avoid 409 conflicts ---
 
 
 # ========= CONFIG =========
