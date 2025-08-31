@@ -39,23 +39,15 @@ os.makedirs(BASE_DIR, exist_ok=True)
 RUN_LOCK_PATH = os.path.join(BASE_DIR, 'instance.lock')
 try:
     fd = os.open(RUN_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(f'pid={os.getpid()}\n')
-    print(f"[INIT] Acquired instance lock at {RUN_LOCK_PATH}", flush=True)
 except FileExistsError:
     print(f"[INIT] Another instance appears to be running (found {RUN_LOCK_PATH}). Exiting to avoid 409.", flush=True)
     import sys; sys.exit(0)
 except Exception as e:
     print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
-
-
-# --- Single instance lock to avoid 409 conflicts ---
-
-except Exception as e:
-    print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
-
-
-# --- Single instance lock to avoid 409 conflicts ---
+else:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(f'pid={os.getpid()}\n')
+    print(f"[INIT] Acquired instance lock at {RUN_LOCK_PATH}", flush=True)
 
 
 # ========= CONFIG =========
