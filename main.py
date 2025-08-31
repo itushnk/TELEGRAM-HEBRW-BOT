@@ -23,7 +23,7 @@ import csv
 import requests
 import time
 import telebot
-from aliexpress import fetch_products_by_category
+from ae_portal import affiliate_product_query_by_category
 from telebot import types
 import threading
 from datetime import datetime, timedelta, time as dtime
@@ -45,6 +45,12 @@ try:
 except FileExistsError:
     print(f"[INIT] Another instance appears to be running (found {RUN_LOCK_PATH}). Exiting to avoid 409.", flush=True)
     import sys; sys.exit(0)
+except Exception as e:
+    print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
+
+
+# --- Single instance lock to avoid 409 conflicts ---
+
 except Exception as e:
     print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
 
@@ -807,6 +813,15 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
+    data = getattr(c, 'data', '') or ''
+    chat_id = (getattr(getattr(c, 'message', None), 'chat', None).id
+               if getattr(c, 'message', None) else getattr(getattr(c, 'from_user', None), 'id', None))
+    if is_bot_locked() and data != 'bot_toggle':
+        try:
+            bot.answer_callback_query(c.id, 'הבוט כבוי כרגע.', show_alert=True)
+        except Exception:
+            pass
+        return
     try:
         data = c.data or ""
     except Exception:
@@ -841,7 +856,7 @@ def on_inline_click(c):
             return
         cat = data.split("_", 2)[2]
         try:
-            prods = fetch_products_by_category(cat, page_size=5, ship_to="IL")
+            prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country='IL')
             rows = [normalize_ae_product(p) for p in prods]
             append_to_pending(rows)
             with FILE_LOCK:
