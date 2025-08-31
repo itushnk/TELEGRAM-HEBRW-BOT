@@ -1667,3 +1667,24 @@ def toggle_mode(msg):
     new_mode = "off" if mode == "on" else "on"
     write_auto_flag(new_mode)
     bot.reply_to(msg, f"✅ מצב אוטומטי עודכן ל: {'פעיל 🟢' if new_mode == 'on' else 'כבוי 🔴'}")
+
+if __name__ == '__main__':
+    # Ensure polling is active
+    try:
+        __POLL_STARTED
+    except NameError:
+        __POLL_STARTED = False
+    if not __POLL_STARTED:
+        def __run_polling():
+            while True:
+                try:
+                    bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
+                except Exception as e:
+                    print(f"[POLL] {e} — retry in 3s", flush=True)
+                    time.sleep(3)
+        t = threading.Thread(target=__run_polling, daemon=False)
+        t.start()
+        __POLL_STARTED = True
+    print('[BOOT] Keepalive loop running', flush=True)
+    while True:
+        time.sleep(300)
