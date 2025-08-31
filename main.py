@@ -1596,7 +1596,22 @@ if __name__ == "__main__":
     t = threading.Thread(target=auto_post_loop, daemon=True)
     t.start()
 
-    while True:
+    
+
+# --- Basic /start and /menu handlers ---
+@bot.message_handler(commands=['start', 'menu'])
+def _cmd_start_menu(m):
+    try:
+        km = inline_menu() if 'inline_menu' in globals() else None
+    except Exception:
+        km = None
+    msg = "היי! הנה התפריט הראשי." if not is_bot_locked() else "הבוט כבוי כרגע. אפשר להפעיל/לכבות מהתפריט."
+    try:
+        bot.reply_to(m, msg, reply_markup=km)
+    except Exception:
+        bot.reply_to(m, msg)
+
+while True:
         try:
             bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=20)
         except Exception as e:
