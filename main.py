@@ -804,6 +804,41 @@ def inline_menu():
 
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
+
+def do_ae_pull(cat: str, chat_id: int, cb_id: str | None = None):
+    """Shared AliExpress pull routine for both callback and text flows."""
+    try:
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id, "⏳ מבצע שאיבה…", show_alert=False)
+            except Exception:
+                pass
+        prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country="IL")
+        rows = [normalize_ae_product(p) for p in prods]
+        append_to_pending(rows)
+        with FILE_LOCK:
+            pending_count = len(read_products(PENDING_CSV))
+        msg = f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}"
+        try:
+            bot.send_message(chat_id, msg, reply_markup=inline_menu())
+        except Exception:
+            # Fallback
+            bot.send_message(chat_id, msg)
+        return True
+    except Exception as e:
+        emsg = str(e)
+        print(f"[AE][ERR] {emsg}", flush=True)
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id, f"שגיאה בשאיבה: {emsg[:180]}", show_alert=True)
+            except Exception:
+                pass
+        try:
+            bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:180]}")
+        except Exception:
+            pass
+        return False
+
 def on_inline_click(c):
     data = getattr(c, 'data', '') or ''
     chat_id = (getattr(getattr(c, 'message', None), 'chat', None).id
@@ -844,8 +879,14 @@ def on_inline_click(c):
 
     if data.startswith("ae_cat_"):
         if is_bot_locked():
-            bot.answer_callback_query(c.id, "הבוט כבוי כרגע. הפעל אותו מהתפריט.", show_alert=True)
+            try:
+                bot.answer_callback_query(c.id, "הבוט כבוי כרגע. הפעל אותו מהתפריט.", show_alert=True)
+            except Exception:
+                pass
             return
+        cat = data.split("_", 2)[2]
+        do_ae_pull(cat=cat, chat_id=chat_id, cb_id=c.id)
+        return
         cat = data.split("_", 2)[2]
         try:
             prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country='IL')
@@ -1467,6 +1508,19 @@ def _debug_log_everything(msg):
 
 
 # ========= MAIN =========
+
+
+# --- Text fallback to trigger category pulls (for ReplyKeyboard or manual text) ---
+AE_CATEGORY_RE = re.compile(r"^קטגוריה[:\-– ]*(?P<cat>[A-Za-z0-9_,\-]+)$")
+
+@bot.message_handler(func=lambda m: isinstance(getattr(m, 'text', ''), str) and AE_CATEGORY_RE.match(m.text or ''))
+def _on_category_text(m):
+    cat = AE_CATEGORY_RE.match(m.text).group('cat')
+    if is_bot_locked():
+        bot.reply_to(m, "הבוט כבוי כרגע. הפעל אותו מהתפריט.")
+        return
+    do_ae_pull(cat=cat, chat_id=m.chat.id, cb_id=None)
+
 if __name__ == "__main__":
     print(f"Instance: {socket.gethostname()}", flush=True)
     try:
