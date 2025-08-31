@@ -1,16 +1,4 @@
 import os
-
-
-# --- Single instance lock to avoid 409 conflicts ---
-try:
-    # Try to acquire exclusive lock by creating the file only if it doesn't exist
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(f"pid={os.getpid()}\n")
-except FileExistsError:
-    import sys; sys.exit(0)
-except Exception as e:
-    print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
-
 # -*- coding: utf-8 -*-
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -30,14 +18,28 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 import socket
 import re
+import atexit
+
+# --- Telegram token from ENV ---
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN') or os.getenv('BOT_TOKEN') or ''
+if not BOT_TOKEN:
+    print('[INIT] Missing TELEGRAM_BOT_TOKEN/BOT_TOKEN in ENV', flush=True)
 
 
 # ========= PERSISTENT DATA DIR =========
 BASE_DIR = os.environ.get("BOT_DATA_DIR", "./data")
 os.makedirs(BASE_DIR, exist_ok=True)
 
-# --- Single instance lock to avoid 409 conflicts ---
+# --- Single instance lock to avoid double polling (409) ---
 RUN_LOCK_PATH = os.path.join(BASE_DIR, 'instance.lock')
+def _cleanup_lock():
+    try:
+        if os.path.exists(RUN_LOCK_PATH):
+            os.remove(RUN_LOCK_PATH)
+            print(f"[EXIT] Removed lock {RUN_LOCK_PATH}", flush=True)
+    except Exception:
+        pass
+atexit.register(_cleanup_lock)
 try:
     fd = os.open(RUN_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
 except FileExistsError:
@@ -49,6 +51,13 @@ else:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
         f.write(f'pid={os.getpid()}\n')
     print(f"[INIT] Acquired instance lock at {RUN_LOCK_PATH}", flush=True)
+
+
+
+# ========= CONFIG =========
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # חובה ב-ENV
+CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL", "@your_channel")  # יעד ציבורי ברירת מחדל
+ADMIN_USER_IDS = set()  # מומלץ: {123456789}
 
 # קבצים (בתיקיית DATA המתמשכת או לוקאלית)
 DATA_CSV = os.path.join(BASE_DIR, "workfile.csv")        # קובץ המקור האחרון שהועלה
@@ -834,6 +843,47 @@ def do_ae_pull(cat: str, chat_id: int | None = None, cb_id: str | None = None):
             pass
         return False
 
+
+def do_ae_pull_async(cat: str, chat_id: int, cb_id: str | None = None):
+    """Run AliExpress pull in a background thread and respond quickly to Telegram callback."""
+    try:
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id, "⏳ מתחיל לשאוב…", show_alert=False)
+            except Exception:
+                pass
+        try:
+            bot.send_message(chat_id, "⏳ מתחיל לשאוב… זה עשוי לקחת כמה שניות.")
+        except Exception:
+            pass
+
+        def _worker():
+            try:
+                prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country="IL")
+                rows = [normalize_ae_product(p) for p in prods]
+                append_to_pending(rows)
+                with FILE_LOCK:
+                    pending_count = len(read_products(PENDING_CSV))
+                msg = f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}"
+                try:
+                    bot.send_message(chat_id, msg, reply_markup=inline_menu()) if chat_id is not None else None
+                except Exception:
+                    bot.send_message(chat_id, msg) if chat_id is not None else None
+            except Exception as e:
+                emsg = str(e)
+                print(f"[AE][ERR] {emsg}", flush=True)
+                tip = ""
+                if "Timeout" in emsg or "timed out" in emsg:
+                    tip = "\n↪️ ניתן להגדיר AE_GATEWAY_LIST=https://eco.taobao.com/router/rest או פרוקסי ב-AE_HTTPS_PROXY"
+                try:
+                    bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:300]}{tip}")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        print(f"[AE][ERR-async] {e}", flush=True)
+
 def on_inline_click(c):
     data = getattr(c, 'data', '') or ''
     chat_id = (getattr(getattr(c, 'message', None), 'chat', None).id
@@ -879,6 +929,9 @@ def on_inline_click(c):
             except Exception:
                 pass
             return
+        cat = data.split("_", 2)[2]
+        do_ae_pull_async(cat=cat, chat_id=chat_id, cb_id=c.id)
+        return
         cat = data.split("_", 2)[2]
         do_ae_pull(cat=cat, chat_id=chat_id, cb_id=c.id)
         return
