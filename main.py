@@ -839,6 +839,47 @@ def do_ae_pull(cat: str, chat_id: int, cb_id: str | None = None):
             pass
         return False
 
+
+def do_ae_pull_async(cat: str, chat_id: int, cb_id: str | None = None):
+    """Run AliExpress pull in a background thread and respond quickly to Telegram callback."""
+    try:
+        if cb_id:
+            try:
+                bot.answer_callback_query(cb_id, "⏳ מתחיל לשאוב…", show_alert=False)
+            except Exception:
+                pass
+        try:
+            bot.send_message(chat_id, "⏳ מתחיל לשאוב… זה עשוי לקחת כמה שניות.")
+        except Exception:
+            pass
+
+        def _worker():
+            try:
+                prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country="IL")
+                rows = [normalize_ae_product(p) for p in prods]
+                append_to_pending(rows)
+                with FILE_LOCK:
+                    pending_count = len(read_products(PENDING_CSV))
+                msg = f"✅ נוספו {len(rows)} מוצרים. כעת בתור: {pending_count}"
+                try:
+                    bot.send_message(chat_id, msg, reply_markup=inline_menu())
+                except Exception:
+                    bot.send_message(chat_id, msg)
+            except Exception as e:
+                emsg = str(e)
+                print(f"[AE][ERR] {emsg}", flush=True)
+                tip = ""
+                if "Timeout" in emsg or "timed out" in emsg:
+                    tip = "\n↪️ ניתן להגדיר AE_GATEWAY_LIST=https://eco.taobao.com/router/rest או פרוקסי ב-AE_HTTPS_PROXY"
+                try:
+                    bot.send_message(chat_id, f"שגיאה בשאיבה: {emsg[:300]}{tip}")
+                except Exception:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception as e:
+        print(f"[AE][ERR-async] {e}", flush=True)
+
 def on_inline_click(c):
     data = getattr(c, 'data', '') or ''
     chat_id = (getattr(getattr(c, 'message', None), 'chat', None).id
@@ -884,6 +925,9 @@ def on_inline_click(c):
             except Exception:
                 pass
             return
+        cat = data.split("_", 2)[2]
+        do_ae_pull_async(cat=cat, chat_id=chat_id, cb_id=c.id)
+        return
         cat = data.split("_", 2)[2]
         do_ae_pull(cat=cat, chat_id=chat_id, cb_id=c.id)
         return
