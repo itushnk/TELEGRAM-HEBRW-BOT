@@ -278,6 +278,101 @@ def usd_to_ils(amount_text, rate=None):
     except Exception:
         return str(amount_text)
 
+
+
+# ===== AliExpress Fallback (Scrape) =====
+import json as _json, re as _re
+from urllib.parse import urlencode as _urlencode
+import requests as _req
+
+def _ae_fallback_fetch(query: str, limit: int = 8, ship_to: str = "IL"):
+    """
+    Lightweight scraper that extracts product list from AliExpress search page JSON.
+    Returns list of dicts compatible with normalize_ae_product expectations.
+    """
+    try:
+        params = {
+            "SearchText": query,
+            "ShipCountry": ship_to or "IL",
+            "SortType": "total_tranpro_desc",
+            "g": "y"
+        }
+        url = "https://www.aliexpress.com/wholesale?" + _urlencode(params, doseq=True)
+        sess = _req.Session()
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+            "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Referer": "https://www.aliexpress.com/"
+        })
+        cookies = {"xman_us_f": "x_lan=he_IL&x_locale=he_IL&region=IL&b_locale=he_IL"}
+        r = sess.get(url, timeout=(10, 20), cookies=cookies)
+        r.raise_for_status()
+        html = r.text
+        items = []
+
+        for pat in [r"window\.__AER_DATA__\s*=\s*(\{.*?\});", r"window\.runParams\s*=\s*(\{.*?\});"]:
+            m = _re.search(pat, html, _re.S)
+            if not m:
+                continue
+            raw = m.group(1).strip().rstrip(";")
+            try:
+                data = _json.loads(raw)
+            except Exception:
+                continue
+
+            def _walk(o):
+                if isinstance(o, dict):
+                    pid = o.get("productId") or o.get("product_id") or o.get("itemId") or o.get("item_id") or o.get("id")
+                    title = o.get("title") or o.get("productTitle") or o.get("product_title")
+                    url = o.get("productDetailUrl") or o.get("product_detail_url") or o.get("productUrl") or o.get("url")
+                    img = o.get("productMainImageUrl") or o.get("product_main_image_url") or o.get("image") or o.get("imageUrl") or o.get("image_url")
+                    price = o.get("appSalePrice") or o.get("salePrice") or o.get("app_sale_price") or o.get("sale_price") or o.get("price")
+                    if pid and title and url:
+                        items.append({
+                            "id": str(pid),
+                            "title": str(title),
+                            "url": str(url),
+                            "image_url": img or "",
+                            "price": price or "",
+                            "rating": o.get("evaluateRate") or o.get("evaluate_rate") or o.get("rating") or "",
+                            "orders": o.get("orders") or o.get("ordersCount") or o.get("orders_count") or ""
+                        })
+                    for v in o.values():
+                        _walk(v)
+                elif isinstance(o, list):
+                    for it in o:
+                        _walk(it)
+            _walk(data)
+            if items:
+                break
+
+        if not items:
+            for m in _re.finditer(r'href="(https://www\.aliexpress\.com/item/[^"]+)"[^>]*>([^<]{10,120})</a>', html):
+                url, title = m.group(1), m.group(2).strip()
+                items.append({
+                    "id": str(abs(hash(url))),
+                    "title": title,
+                    "url": url,
+                    "image_url": "",
+                    "price": "",
+                    "rating": "",
+                    "orders": ""
+                })
+
+        uniq, out = set(), []
+        for it in items:
+            pid = it.get("id")
+            if not pid or pid in uniq:
+                continue
+            uniq.add(pid)
+            out.append(it)
+            if len(out) >= limit:
+                break
+        return out
+    except Exception as e:
+        print(f"[AE][FALLBACK][ERR] {e}", flush=True)
+        return []
+
 def normalize_ae_product(p, rate=None):
     item_id = str(p.get("product_id") or p.get("item_id") or p.get("id") or "")
     title_en = (p.get("product_title") or p.get("title") or "").strip()
@@ -805,7 +900,6 @@ def inline_menu():
 # ========= INLINE CALLBACKS =========
 @bot.callback_query_handler(func=lambda c: True)
 def on_inline_click(c):
-    global POST_DELAY_SECONDS, CURRENT_TARGET
     data = getattr(c, 'data', '') or ''
     chat_id = (getattr(getattr(c, 'message', None), 'chat', None).id
                if getattr(c, 'message', None) else getattr(getattr(c, 'from_user', None), 'id', None))
@@ -844,54 +938,6 @@ def on_inline_click(c):
         return
 
     if data.startswith("ae_cat_"):
-        try:
-            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-        except Exception:
-            pass
-        if is_bot_locked():
-            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-            return
-        cat = data.split("_", 2)[2]
-        try:
-            prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country='IL')
-            rows = [normalize_ae_product(p) for p in prods]
-            append_to_pending(rows)
-            with FILE_LOCK:
-                pending_count = len(read_products(PENDING_CSV))
-            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-            safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                              new_text="✅ השאיבה הושלמה. חזור לתפריט הראשי:",
-                              reply_markup=inline_menu(), cb_id=c.id)
-        except Exception as e:
-            msg = str(e)
-            print(f"[AE][ERR] {msg}", flush=True)
-            try:
-                bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-            except Exception:
-                pass
-        return
-
-
-
-
-    if data == "bot_toggle":
-        now_locked = toggle_bot_lock()
-        state = "🔴 כבוי" if now_locked else "🟢 פעיל"
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text=f"מצב הבוט כעת: {state}", reply_markup=inline_menu(), cb_id=c.id)
-        return
-    chat_id = c.message.chat.id
-
-    if data == "publish_now":
-        if is_bot_locked():
-            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-            return
-        ok = send_next_locked("manual")
-        if not ok:
-            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
-            return
-        safe_edit_message(bot, chat_id=chat_id, message=c.message,
-                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
         try:
             bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
         except Exception:
