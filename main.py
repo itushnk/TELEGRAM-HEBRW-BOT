@@ -1,16 +1,3 @@
-import os
-
-
-# --- Single instance lock to avoid 409 conflicts ---
-try:
-    # Try to acquire exclusive lock by creating the file only if it doesn't exist
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(f"pid={os.getpid()}\n")
-except FileExistsError:
-    import sys; sys.exit(0)
-except Exception as e:
-    print(f"[INIT] Could not create instance lock ({e}). Continuing...", flush=True)
-
 # -*- coding: utf-8 -*-
 import os, sys
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
@@ -970,6 +957,7 @@ def on_inline_click(c):
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data.startswith("delay_"):
+        global POST_DELAY_SECONDS
         try:
             seconds = int(data.split("_", 1)[1])
             if seconds <= 0:
@@ -985,6 +973,7 @@ def on_inline_click(c):
             bot.answer_callback_query(c.id, f"שגיאה בעדכון מרווח: {e}", show_alert=True)
 
     elif data == "target_public":
+        global CURRENT_TARGET
         v = _load_preset(PUBLIC_PRESET_FILE)
         if v is None:
             bot.answer_callback_query(c.id, "לא הוגדר יעד ציבורי. בחר דרך '🆕 בחר ערוץ ציבורי'.", show_alert=True)
@@ -996,6 +985,7 @@ def on_inline_click(c):
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "target_private":
+        global CURRENT_TARGET
         v = _load_preset(PRIVATE_PRESET_FILE)
         if v is None:
             bot.answer_callback_query(c.id, "לא הוגדר יעד פרטי. בחר דרך '🆕 בחר ערוץ פרטי'.", show_alert=True)
@@ -1057,6 +1047,7 @@ def on_inline_click(c):
 
     
     elif data == "delay_1200":
+        global POST_DELAY_SECONDS
         POST_DELAY_SECONDS = 1200
         save_delay_seconds(POST_DELAY_SECONDS)
         DELAY_EVENT.set()
@@ -1066,6 +1057,7 @@ def on_inline_click(c):
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "delay_1500":
+        global POST_DELAY_SECONDS
         POST_DELAY_SECONDS = 1500
         save_delay_seconds(POST_DELAY_SECONDS)
         DELAY_EVENT.set()
@@ -1075,6 +1067,7 @@ def on_inline_click(c):
                           reply_markup=inline_menu(), cb_id=c.id)
 
     elif data == "delay_1800":
+        global POST_DELAY_SECONDS
         POST_DELAY_SECONDS = 1800
         save_delay_seconds(POST_DELAY_SECONDS)
         DELAY_EVENT.set()
