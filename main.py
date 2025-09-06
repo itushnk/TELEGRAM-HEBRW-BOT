@@ -844,6 +844,58 @@ def on_inline_click(c):
         return
 
     if data.startswith("ae_cat_"):
+        try:
+            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+        except Exception:
+            pass
+        if is_bot_locked():
+            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+            return
+        cat = data.split("_", 2)[2]
+        try:
+            prods = affiliate_product_query_by_category(category_id=cat, page_no=1, page_size=5, country='IL')
+            rows = [normalize_ae_product(p) for p in prods]
+            append_to_pending(rows)
+            with FILE_LOCK:
+                pending_count = len(read_products(PENDING_CSV))
+            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+            safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                              new_text="✅ השאיבה הושלמה. חזור לתפריט הראשי:",
+                              reply_markup=inline_menu(), cb_id=c.id)
+        except Exception as e:
+            msg = str(e)
+            print(f"[AE][ERR] {msg}", flush=True)
+            try:
+                bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+            except Exception:
+                pass
+        return
+
+
+
+
+    if data == "bot_toggle":
+        now_locked = toggle_bot_lock()
+        state = "🔴 כבוי" if now_locked else "🟢 פעיל"
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text=f"מצב הבוט כעת: {state}", reply_markup=inline_menu(), cb_id=c.id)
+        return
+    chat_id = c.message.chat.id
+
+    if data == "publish_now":
+        if is_bot_locked():
+            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+            return
+        ok = send_next_locked("manual")
+        if not ok:
+            bot.send_message(c.message.chat.id, "ℹ️ עדכון בוצע.")
+            return
+        safe_edit_message(bot, chat_id=chat_id, message=c.message,
+                          new_text="✅ נשלח הפריט הבא בתור.", reply_markup=inline_menu(), cb_id=c.id)
+        try:
+            bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
+        except Exception:
+            pass
         if is_bot_locked():
             bot.answer_callback_query(c.id, "הבוט כבוי כרגע. הפעל אותו מהתפריט.", show_alert=True)
             return
