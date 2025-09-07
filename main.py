@@ -18,8 +18,10 @@ RAILWAY_DOMAIN = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RAILWAY_PUBLIC_DO
 RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or ""
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET") or "secret"
 
-ADMIN_ID = os.getenv("ADMIN_ID")  # optional
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # optional, 0 = disabled
 CURRENCY = os.getenv("CURRENCY", "₪")
+TARGET_CHAT_ID_ENV = os.getenv("TARGET_CHAT_ID", "").strip()  # channel/group id (e.g., -1001234567890)
+TARGET_CHAT_ID = int(TARGET_CHAT_ID_ENV) if TARGET_CHAT_ID_ENV and TARGET_CHAT_ID_ENV.lstrip("-").isdigit() else None
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,6 +80,28 @@ def pending_count() -> int:
         return 0
     with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
         return max(0, sum(1 for _ in f) - 1)
+
+def pop_next_pending():
+    """Pop first item row from pending.csv (FIFO). Returns dict or None."""
+    if not PENDING_CSV.exists():
+        return None
+    rows = []
+    with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        rows = list(reader)
+    if len(rows) <= 1:
+        return None
+    header = rows[0]
+    item_row = rows[1]
+    # rewrite minus the first data row
+    with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rows[2:]:
+            w.writerow(r)
+    keys = ["item_id","title","url","price","image_url","ts"]
+    item = dict(zip(keys, item_row + [""]*(len(keys)-len(item_row))))
+    return item
 
 # Simple, resilient AE fallback via HTML
 def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
@@ -163,6 +187,31 @@ def build_categories():
     kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="back"))
     return kb
 
+def format_post(item: dict) -> str:
+    title = (item.get("title") or "").strip()
+    url = (item.get("url") or "").strip()
+    price = (item.get("price") or "").strip()
+    # שמור על טקסט נקי בעברית + קריאה לפעולה
+    parts = [f"🛍️ {title}"]
+    if price:
+        parts.append(f"💰 מחיר: {price} {CURRENCY}".strip())
+    parts.append("👉 לחץ להזמנה בקישור מטה")
+    return "\n\n".join(parts), url
+
+def send_item(item: dict, chat_id: int):
+    text, url = format_post(item)
+    img = (item.get("image_url") or "").strip()
+    kb = types.InlineKeyboardMarkup()
+    if url:
+        kb.add(types.InlineKeyboardButton("🛒 לקנייה עכשיו", url=url))
+    if img:
+        try:
+            bot.send_photo(chat_id, img, caption=text, reply_markup=kb)
+            return
+        except Exception as e:
+            print(f"[POST][WARN] send_photo failed: {e}", flush=True)
+    bot.send_message(chat_id, text, reply_markup=kb)
+
 # ======= Commands =======
 @bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
@@ -183,6 +232,26 @@ def cmd_off(m):
 def cmd_status(m):
     bot.reply_to(m, f"📥 פריטים ממתינים: {pending_count()} | מצב בוט: {'כבוי' if is_locked() else 'פעיל'}")
 
+@bot.message_handler(commands=["here"])
+def cmd_here(m):
+    bot.reply_to(m, f"chat_id: <code>{m.chat.id}</code>")
+
+@bot.message_handler(commands=["post"])
+def cmd_post(m):
+    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
+        bot.reply_to(m, "⛔ אין הרשאה לביצוע הפעולה הזו.")
+        return
+    if is_locked():
+        bot.reply_to(m, "הבוט כבוי.")
+        return
+    item = pop_next_pending()
+    if not item:
+        bot.reply_to(m, "אין פריטים בתור.")
+        return
+    target = TARGET_CHAT_ID or m.chat.id
+    send_item(item, target)
+    bot.reply_to(m, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
+
 # ======= Callbacks =======
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
@@ -199,7 +268,16 @@ def on_cb(c):
         if data == "back":
             bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); return
         if data == "post_now":
-            bot.answer_callback_query(c.id, "🚀—דמו"); return
+            if is_locked():
+                bot.answer_callback_query(c.id, "הבוט כבוי.", show_alert=True); return
+            item = pop_next_pending()
+            if not item:
+                bot.answer_callback_query(c.id, "אין פריטים בתור", show_alert=True); return
+            target = TARGET_CHAT_ID or c.message.chat.id
+            send_item(item, target)
+            bot.answer_callback_query(c.id, "✅ פורסם")
+            bot.send_message(c.message.chat.id, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
+            return
         if data.startswith("ae_cat:"):
             if is_locked():
                 bot.answer_callback_query(c.id, "הבוט כבוי.", show_alert=True); return
