@@ -1,5 +1,5 @@
-# v7c – Telegram 502 fix + affiliate-enforced
-- Webhook ACK immediately (background thread processes update) -> no 502 Bad Gateway from Telegram.
-- Category click answers quickly, heavy work happens after.
-- Adds more keywords per category.
-- Only affiliate links enter queue (REQUIRE_AFFILIATE=1 by default). Fallback to s.click if AE_AFF_SHORT_KEY set.
+# v7d – stronger discovery + webhook 502 fix
+- Tries AliExpress mobile endpoints first, then desktop variants, then DuckDuckGo HTML.
+- Immediate webhook ACK (background thread) avoids Telegram 502.
+- Queue CSV (data/pending.csv) auto-created.
+- Only affiliate links go into queue (REQUIRE_AFFILIATE=1). Fallback to s.click if AE_AFF_SHORT_KEY is set.

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram webhook bot with AliExpress affiliate-enforced links.
-v7c: fixes Telegram 502 by ACKing webhook immediately (background processing).
+v7d: stronger discovery (mobile + multiple endpoints) + webhook 502 fix.
 """
 import os, time, csv, random, re, threading
 from pathlib import Path
@@ -28,7 +28,6 @@ REQUIRE_AFFILIATE = os.getenv("REQUIRE_AFFILIATE","1") == "1"
 AE_APP_KEY = os.getenv("AE_API_APP_KEY", "").strip()
 AE_APP_SECRET = os.getenv("AE_APP_SECRET", "").strip()
 AE_TRACKING_ID = os.getenv("AE_TRACKING_ID", "").strip()
-AE_GATEWAY_LIST = [u.strip() for u in (os.getenv("AE_GATEWAY_LIST","").split(",") if os.getenv("AE_GATEWAY_LIST") else [])]
 AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY","").strip()  # optional fallback
 
 # Timing
@@ -67,29 +66,45 @@ def ensure_pending_csv():
             w.writerow(["item_id","title","url","price","image_url","ts","aff_ok"])
 
 def pending_count():
-    if not PENDING_CSV.exists(): return 0
+    if not PENDING_CSV.exists():
+        return 0
     with PENDING_CSV.open("r", encoding="utf-8") as f:
-        return max(0, sum(1 for _ in f)-1)
+        return max(0, sum(1 for _ in f) - 1)
 
 def append_rows(rows):
     ensure_pending_csv()
     with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for r in rows:
-            w.writerow([r.get("id",""), r.get("title",""), r.get("url",""), r.get("price",""), r.get("image_url",""), int(time.time()), "1" if r.get("aff_ok") else "0"])
+            w.writerow([
+                r.get("id",""),
+                r.get("title",""),
+                r.get("url",""),
+                r.get("price",""),
+                r.get("image_url",""),
+                int(time.time()),
+                "1" if r.get("aff_ok") else "0"
+            ])
 
 def pop_next_pending():
-    if not PENDING_CSV.exists(): return None
+    if not PENDING_CSV.exists():
+        return None
     with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
-    if len(rows) <= 1: return None
+    if len(rows) <= 1:
+        return None
     header, first, rest = rows[0], rows[1], rows[2:]
     with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(header); [w.writerow(r) for r in rest]
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rest:
+            w.writerow(r)
     keys = ["item_id","title","url","price","image_url","ts","aff_ok"]
-    return dict(zip(keys, first + [""]*(len(keys)-len(first))))
+    if len(first) < len(keys):
+        first = first + [""]*(len(keys)-len(first))
+    return dict(zip(keys, first))
 
-# ======= AliExpress: discovery (scraping) =======
+# ======= AliExpress: discovery (mobile + desktop + DDG) =======
 _UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -97,40 +112,71 @@ _UA_LIST = [
 ]
 def _sess():
     s = requests.Session()
-    s.headers.update({"User-Agent": random.choice(_UA_LIST), "Accept-Language":"en-US,en;q=0.9"})
+    s.headers.update({
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept-Language":"en-US,en;q=0.9",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
     return s
 
-def _fetch_html(url, s, timeout=(8,12)):
+def _fetch_html(url, s, timeout=(7,10)):
     r = s.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
+_ITEM_RE = re.compile(r'https?://(?:[a-z]+\.)?aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', re.I)
+
 def _parse_item_links(html):
     out, seen = [], set()
-    for m in re.finditer(r'https?://(?:www|m)\.aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', html):
+    for m in _ITEM_RE.finditer(html):
         url, pid = m.group(0), m.group(1)
-        if url in seen: continue
+        if url in seen: 
+            continue
+        seen.add(url)
+        out.append({"id": pid, "url": url})
+    for m in re.finditer(r'href=["\'](/item/(\d{8,})\.html)["\']', html):
+        pid = m.group(2)
+        url = f"https://m.aliexpress.com/item/{pid}.html"
+        if url in seen: 
+            continue
         seen.add(url)
         out.append({"id": pid, "url": url})
     return out
 
 def _scrape_meta(url, s):
     try:
-        h = _fetch_html(url, s, timeout=(6,10))
+        h = _fetch_html(url, s, timeout=(5,8))
         title = None
         m = re.search(r'property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', h)
-        if m: title = m.group(1)
-        m = re.search(r'<title>\s*([^<]+)\s*</title>', h);  title = title or (m.group(1) if m else None)
+        if m:
+            title = m.group(1)
+        m = re.search(r'<title>\s*([^<]+)\s*</title>', h)
+        if (not title) and m:
+            title = m.group(1)
         img = None
-        m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h);  img = m.group(1) if m else None
-        return {"id": re.search(r'(\d{8,})\.html', url).group(1), "title": title or "AliExpress product", "url": url, "image_url": img or "", "price": ""}
+        m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h)
+        if m:
+            img = m.group(1)
+        pid_match = re.search(r'(\d{8,})\.html', url)
+        pid = pid_match.group(1) if pid_match else ""
+        return {
+            "id": pid,
+            "title": (title or "AliExpress product").strip(),
+            "url": url,
+            "image_url": img or "",
+            "price": ""
+        }
     except Exception as e:
-        print(f"[META][WARN] {url} -> {e}", flush=True); return None
+        print(f"[META][WARN] {url} -> {e}", flush=True)
+        return None
 
-def discover(query, limit=10):
+def discover(query, limit=12):
     s = _sess()
     urls = [
-        f"https://www.aliexpress.com/af/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc&page={p}" for p in [1,2,3]
+        f"https://m.aliexpress.com/wholesale/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/af/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/wholesale?SearchText={quote_plus(query)}&g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/w/wholesale-{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
     ] + [
         f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60,90]
     ]
@@ -139,19 +185,23 @@ def discover(query, limit=10):
         try:
             html = _fetch_html(u, s)
             found += _parse_item_links(html)
-            if len(found) >= limit*2: break
+            if len(found) >= limit*2:
+                break
         except Exception as e:
             print(f"[DISCOVER][WARN] {u} -> {e}", flush=True)
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for it in found:
-        if it["url"] in seen: continue
-        seen.add(it["url"]); uniq.append(it["url"])
-        if len(uniq) >= limit: break
+        if it["url"] in seen:
+            continue
+        seen.add(it["url"])
+        uniq.append(it["url"])
+        if len(uniq) >= limit:
+            break
     items = []
     for u in uniq:
         m = _scrape_meta(u, s)
-        if m: items.append(m)
+        if m:
+            items.append(m)
     print(f"[DISCOVER] '{query}' -> {len(items)} items", flush=True)
     return items
 
@@ -181,25 +231,31 @@ def _aliexpress_api_client():
         return None
 
 def _s_click_fallback(url: str):
-    if not AE_AFF_SHORT_KEY: 
+    if not AE_AFF_SHORT_KEY:
         return None
     base = "https://s.click.aliexpress.com/deep_link.htm"
-    return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(url)}"
+    target = url
+    if "?" in target:
+        target += f"&shipCountry={quote_plus(SHIP_TO)}"
+    else:
+        target += f"?shipCountry={quote_plus(SHIP_TO)}"
+    return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(target)}"
 
 AFF_MAKER = _aliexpress_api_client()
 
 def to_affiliate(url: str):
     u = (url or "").strip()
-    if not u: return u, False
+    if not u:
+        return u, False
     if AFF_MAKER:
         link = AFF_MAKER(u)
-        if link: 
+        if link:
             print(f"[AFF] API OK -> {link[:80]}...", flush=True)
             return link, True
         else:
             print("[AFF] API FAIL", flush=True)
     link = _s_click_fallback(u)
-    if link: 
+    if link:
         print(f"[AFF] s.click OK -> {link[:80]}...", flush=True)
         return link, True
     print("[AFF] NO-AFF", flush=True)
@@ -210,7 +266,7 @@ CATS = [
     ("gadgets","📱 גאדג'טים",["gadgets electronic gadget", "smart gadget", "electronics accessories", "usb gadget"]),
     ("fashion_men","👔 אופנת גברים",["men compression shorts running gym", "training tights men", "sportswear men"]),
     ("fashion_women","👗 אופנת נשים",["women leggings yoga gym", "women sport leggings", "yoga pants women"]),
-    ("home_tools","🧰 כלי בית",["home tools hardware screwdriver drill set", "household tools set"]),
+    ("home_tools","🧰 כלי בית",["home tools hardware screwdriver drill set", "household tools set", "drill screwdriver set"]),
     ("fitness","🏃 ספורט וכושר",["fitness gear resistance band", "gym accessories", "sports equipment"]),
     ("beauty","💄 ביוטי",["beauty makeup cosmetic", "makeup brush set", "lipstick set"]),
 ]
@@ -235,7 +291,8 @@ def format_post(item):
     title = (item.get("title") or "").strip()
     price = (item.get("price") or "").strip()
     parts = [f"🛍️ {title}", "👉 לחץ להזמנה בקישור מטה"]
-    if price: parts.insert(1, f"💰 מחיר: {price} {CURRENCY}".strip())
+    if price:
+        parts.insert(1, f"💰 מחיר: {price} {CURRENCY}".strip())
     return "\n\n".join(parts)
 
 def send_item(item, chat_id):
@@ -244,13 +301,14 @@ def send_item(item, chat_id):
     img = (item.get("image_url") or "").strip()
     btn_txt = "🛒 לקנייה עכשיו" + (" ✅ אפילייט" if item.get("aff_ok") in ("1",1,True) else "")
     kb = types.InlineKeyboardMarkup()
-    if url: kb.add(types.InlineKeyboardButton(btn_txt, url=url))
+    if url:
+        kb.add(types.InlineKeyboardButton(btn_txt, url=url))
     try:
         if img:
             bot.send_photo(chat_id, img, caption=text, reply_markup=kb)
         else:
             bot.send_message(chat_id, text, reply_markup=kb)
-    except Exception as e:
+    except Exception:
         bot.send_message(chat_id, text + "\n\n(תמונה לא נשלחה)", reply_markup=kb)
 
 # ======= Commands =======
@@ -260,11 +318,13 @@ def cmd_start(m):
 
 @bot.message_handler(commands=["on"])
 def cmd_on(m):
-    set_locked(False); bot.reply_to(m, "🔌 הופעל", reply_markup=build_menu())
+    set_locked(False)
+    bot.reply_to(m, "🔌 הופעל", reply_markup=build_menu())
 
 @bot.message_handler(commands=["off"])
 def cmd_off(m):
-    set_locked(True); bot.reply_to(m, "🛑 כובה", reply_markup=build_menu())
+    set_locked(True)
+    bot.reply_to(m, "🛑 כובה", reply_markup=build_menu())
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m):
@@ -272,9 +332,11 @@ def cmd_status(m):
 
 @bot.message_handler(commands=["post"])
 def cmd_post(m):
-    if is_locked(): return bot.reply_to(m,"הבוט כבוי.")
+    if is_locked():
+        return bot.reply_to(m,"הבוט כבוי.")
     item = pop_next_pending()
-    if not item: return bot.reply_to(m, "אין פריטים בתור.")
+    if not item:
+        return bot.reply_to(m, "אין פריטים בתור.")
     target = TARGET_CHAT_ID or m.chat.id
     send_item(item, target)
     bot.reply_to(m, f"✅ פורסם. נותרו: {pending_count()}")
@@ -282,7 +344,8 @@ def cmd_post(m):
 @bot.message_handler(commands=["aff_test"])
 def cmd_aff_test(m):
     parts = (m.text or "").split(None,1)
-    if len(parts)<2: return bot.reply_to(m,"שימוש: /aff_test <url>")
+    if len(parts) < 2:
+        return bot.reply_to(m,"שימוש: /aff_test <url>")
     u = parts[1].strip()
     aff, ok = to_affiliate(u)
     bot.reply_to(m, f"{'✅' if ok else '⚠️ NO-AFF'}\n{aff}")
@@ -293,7 +356,8 @@ def _discover_many(queries, limit_each=6):
     for q in queries:
         items = discover(q, limit=limit_each)
         res += items
-        if len(res) >= 12: break
+        if len(res) >= 12:
+            break
     return res[:12]
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -302,36 +366,41 @@ def on_cb(c):
         data = c.data or ""
         if data == "cats":
             bot.answer_callback_query(c.id)
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats()); 
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats())
             return
         if data == "back":
             bot.answer_callback_query(c.id)
-            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); 
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu())
             return
         if data == "queue":
-            bot.answer_callback_query(c.id, f"בתור: {pending_count()}"); 
+            bot.answer_callback_query(c.id, f"בתור: {pending_count()}")
             return
         if data == "on":
-            set_locked(False); bot.answer_callback_query(c.id,"🔌 הופעל"); 
+            set_locked(False)
+            bot.answer_callback_query(c.id,"🔌 הופעל")
             return
         if data == "off":
-            set_locked(True); bot.answer_callback_query(c.id,"🛑 כובה"); 
+            set_locked(True)
+            bot.answer_callback_query(c.id,"🛑 כובה")
             return
         if data == "post_now":
-            if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
+            if is_locked():
+                return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
             item = pop_next_pending()
-            if not item: return bot.answer_callback_query(c.id,"אין פריטים בתור", show_alert=True)
+            if not item:
+                return bot.answer_callback_query(c.id,"אין פריטים בתור", show_alert=True)
             send_item(item, TARGET_CHAT_ID or c.message.chat.id)
-            bot.answer_callback_query(c.id,"✅ פורסם"); 
+            bot.answer_callback_query(c.id,"✅ פורסם")
             return
         if data.startswith("ae:"):
-            if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
+            if is_locked():
+                return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
             cid = data.split(":",1)[1]
             queries = next((qs for k,_,qs in CATS if k==cid), [cid])
-            # Respond immediately to avoid Telegram webhook timeout
-            try: bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
-            except Exception: pass
-            # Do heavy work in a short background thread so HTTP webhook response already acked
+            try:
+                bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
+            except Exception:
+                pass
             def work():
                 try:
                     items = _discover_many(queries, limit_each=6)
@@ -352,16 +421,17 @@ def on_cb(c):
             threading.Thread(target=work, daemon=True).start()
             return
     except Exception as e:
-        try: bot.answer_callback_query(c.id, f"שגיאה: {e}")
-        except Exception: pass
+        try:
+            bot.answer_callback_query(c.id, f"שגיאה: {e}")
+        except Exception:
+            pass
 
 # ======= Webhook endpoints =======
 @app.route("/webhook/<secret>", methods=["POST"])
 def webhook(secret):
-    if secret != WEBHOOK_SECRET: 
+    if secret != WEBHOOK_SECRET:
         return "forbidden", 403
     payload = request.get_data(as_text=True) or ""
-    # Process in background to ACK immediately (prevents Telegram 502)
     def worker(data_text: str):
         try:
             upd = telebot.types.Update.de_json(data_text)
@@ -376,12 +446,13 @@ def health():
     return "OK", 200
 
 @app.route("/", methods=["GET"])
-def root(): 
+def root():
     return "OK", 200
 
 def setup_webhook():
-    if not USE_WEBHOOK: 
-        print("[WH] USE_WEBHOOK=0 -> webhook disabled"); return
+    if not USE_WEBHOOK:
+        print("[WH] USE_WEBHOOK=0 -> webhook disabled")
+        return
     try:
         info = bot.get_webhook_info()
         print("getWebhookInfo:", info)
@@ -396,7 +467,7 @@ def setup_webhook():
         bot.set_webhook(url, allowed_updates=["message","callback_query"])
         print("setWebhook:", url)
     except Exception as e:
-        print(f"[WH][ERR] set_webhook: {e}")
+        print(f"[WH] set_webhook: {e}")
 
 def run_server():
     from waitress import serve
