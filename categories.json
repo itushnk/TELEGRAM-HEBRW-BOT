@@ -1,0 +1,126 @@
+[
+  {
+    "name": "צעצועים ורימוט-קונטרול",
+    "sub": [
+      {
+        "name": "כלי בנייה בשלט",
+        "keywords": [
+          "rc excavator",
+          "rc bulldozer",
+          "rc dump truck",
+          "4x4 rc construction"
+        ]
+      },
+      {
+        "name": "רחפנים",
+        "keywords": [
+          "gps drone 4k",
+          "foldable quadcopter 5g"
+        ]
+      },
+      {
+        "name": "מכוניות על שלט",
+        "keywords": [
+          "rc car 4wd brushless",
+          "rc truck off-road"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "כלי עבודה",
+    "sub": [
+      {
+        "name": "סטים",
+        "keywords": [
+          "tool set screwdriver drill ratchet",
+          "electric screwdriver set",
+          "impact driver set"
+        ]
+      },
+      {
+        "name": "גנרטורים/התנעת רכב",
+        "keywords": [
+          "jump starter car",
+          "tire inflator 12v"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "בישול ומטבח",
+    "sub": [
+      {
+        "name": "סירים ומחבתות",
+        "keywords": [
+          "stainless steel pan 316",
+          "wok honeycomb"
+        ]
+      },
+      {
+        "name": "אביזרי מטבח",
+        "keywords": [
+          "knife sharpener professional",
+          "kitchen organizer rack"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "גאדג'טים לרכב",
+    "sub": [
+      {
+        "name": "מצלמות דרך",
+        "keywords": [
+          "dash cam 4k gps",
+          "car dvr night vision"
+        ]
+      },
+      {
+        "name": "ניקוי רכב",
+        "keywords": [
+          "car vacuum wireless",
+          "foam wash brush mop"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "חשמל ואודיו",
+    "sub": [
+      {
+        "name": "רמקולים",
+        "keywords": [
+          "bluetooth speaker 40w waterproof",
+          "outdoor wireless speaker 50w"
+        ]
+      },
+      {
+        "name": "אוזניות",
+        "keywords": [
+          "open ear headphones ldac",
+          "gaming headset wired"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "בית וגן",
+    "sub": [
+      {
+        "name": "תאורה",
+        "keywords": [
+          "solar motion sensor light 1200lm",
+          "luxury led chandelier"
+        ]
+      },
+      {
+        "name": "אמבטיה ואיטום",
+        "keywords": [
+          "waterproof sealing tape pvc",
+          "caulk strip"
+        ]
+      }
+    ]
+  }
+]
