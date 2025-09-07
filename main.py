@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram webhook bot with AliExpress affiliate-enforced links.
-v7d: stronger discovery (mobile + multiple endpoints) + webhook 502 fix.
+v7e: discovery fix — remove /af endpoints (404), add mobile search URLs,
+     add he/aliexpress.us domains, and richer parsers (data-href, productId).
 """
 import os, time, csv, random, re, threading
 from pathlib import Path
@@ -124,23 +125,36 @@ def _fetch_html(url, s, timeout=(7,10)):
     r.raise_for_status()
     return r.text
 
-_ITEM_RE = re.compile(r'https?://(?:[a-z]+\.)?aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', re.I)
+# Accept any xx.aliexpress.(com|us|...)/item/....html and also protocol-relative links
+_ITEM_RE = re.compile(r'(?:https?:)?//[a-z\-]*\.?aliexpress\.(?:com|us)/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', re.I)
 
 def _parse_item_links(html):
     out, seen = [], set()
+    # Normal absolute or protocol-relative item URLs
     for m in _ITEM_RE.finditer(html):
         url, pid = m.group(0), m.group(1)
+        if url.startswith("//"):
+            url = "https:" + url
         if url in seen: 
             continue
         seen.add(url)
         out.append({"id": pid, "url": url})
+    # Mobile relative hrefs
     for m in re.finditer(r'href=["\'](/item/(\d{8,})\.html)["\']', html):
-        pid = m.group(2)
-        url = f"https://m.aliexpress.com/item/{pid}.html"
-        if url in seen: 
-            continue
-        seen.add(url)
-        out.append({"id": pid, "url": url})
+        pid = m.group(2); url = f"https://m.aliexpress.com/item/{pid}.html"
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
+    # data-href attributes commonly used in grid items
+    for m in re.finditer(r'data-href=["\'](//[^"\']*?/item/(\d{8,})\.html[^"\']*)["\']', html):
+        url, pid = m.group(1), m.group(2)
+        if url.startswith("//"): url = "https:" + url
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
+    # productId JSON — reconstruct URL
+    for m in re.finditer(r'["\']productId["\']\s*:\s*["\'](\d{8,})["\']', html):
+        pid = m.group(1); url = f"https://www.aliexpress.com/item/{pid}.html"
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
     return out
 
 def _scrape_meta(url, s):
@@ -148,60 +162,55 @@ def _scrape_meta(url, s):
         h = _fetch_html(url, s, timeout=(5,8))
         title = None
         m = re.search(r'property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', h)
-        if m:
-            title = m.group(1)
+        if m: title = m.group(1)
         m = re.search(r'<title>\s*([^<]+)\s*</title>', h)
-        if (not title) and m:
-            title = m.group(1)
+        if (not title) and m: title = m.group(1)
         img = None
         m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h)
-        if m:
-            img = m.group(1)
-        pid_match = re.search(r'(\d{8,})\.html', url)
-        pid = pid_match.group(1) if pid_match else ""
-        return {
-            "id": pid,
-            "title": (title or "AliExpress product").strip(),
-            "url": url,
-            "image_url": img or "",
-            "price": ""
-        }
+        if m: img = m.group(1)
+        pid_match = re.search(r'(\d{8,})\.html', url); pid = pid_match.group(1) if pid_match else ""
+        return {"id": pid, "title": (title or "AliExpress product").strip(), "url": url, "image_url": img or "", "price": ""}
     except Exception as e:
         print(f"[META][WARN] {url} -> {e}", flush=True)
         return None
 
 def discover(query, limit=12):
     s = _sess()
+    q = quote_plus(query)
     urls = [
-        f"https://m.aliexpress.com/wholesale/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
-        f"https://m.aliexpress.com/af/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
-        f"https://www.aliexpress.com/wholesale?SearchText={quote_plus(query)}&g=y&SortType=total_tranpro_desc",
-        f"https://www.aliexpress.com/w/wholesale-{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc",
-    ] + [
+        f"https://m.aliexpress.com/search.htm?keywords={q}&g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/search?keywords={q}&g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/wholesale/{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://he.aliexpress.com/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.us/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
+    ] + [  # search engine HTML fallbacks
         f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60,90]
     ]
     found = []
     for u in urls:
         try:
             html = _fetch_html(u, s)
-            found += _parse_item_links(html)
+            links = _parse_item_links(html)
+            found += links
+            if links:
+                print(f"[DISCOVER][HIT] {u} -> {len(links)} links", flush=True)
+            else:
+                print(f"[DISCOVER][MISS] {u}", flush=True)
             if len(found) >= limit*2:
                 break
         except Exception as e:
             print(f"[DISCOVER][WARN] {u} -> {e}", flush=True)
     uniq, seen = [], set()
     for it in found:
-        if it["url"] in seen:
-            continue
-        seen.add(it["url"])
-        uniq.append(it["url"])
-        if len(uniq) >= limit:
-            break
+        if it["url"] in seen: continue
+        seen.add(it["url"]); uniq.append(it["url"])
+        if len(uniq) >= limit: break
     items = []
     for u in uniq:
         m = _scrape_meta(u, s)
-        if m:
-            items.append(m)
+        if m: items.append(m)
     print(f"[DISCOVER] '{query}' -> {len(items)} items", flush=True)
     return items
 
