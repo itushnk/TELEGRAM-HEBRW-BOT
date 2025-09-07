@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Telegram bot (webhook) that queues and posts AliExpress products.
-This build *enforces affiliate-only links* when AE_API_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID are set.
-If conversion fails and REQUIRE_AFFILIATE=1, the item is skipped.
+Telegram webhook bot with AliExpress affiliate-enforced links.
+v7c: fixes Telegram 502 by ACKing webhook immediately (background processing).
 """
-import os, time, csv, random, re
+import os, time, csv, random, re, threading
 from pathlib import Path
 from urllib.parse import quote_plus
 import requests
@@ -25,12 +24,12 @@ SHIP_TO = os.getenv("AE_SHIP_TO_COUNTRY", "IL")
 LANG = (os.getenv("AE_TARGET_LANGUAGE", "EN") or "EN").upper()
 REQUIRE_AFFILIATE = os.getenv("REQUIRE_AFFILIATE","1") == "1"
 
-# Affiliate API creds (Open Platform | Portals)
+# Affiliate API creds
 AE_APP_KEY = os.getenv("AE_API_APP_KEY", "").strip()
 AE_APP_SECRET = os.getenv("AE_APP_SECRET", "").strip()
-AE_TRACKING_ID = os.getenv("AE_TRACKING_ID", "").strip()  # sometimes called 'pid' or 'trackingId'
+AE_TRACKING_ID = os.getenv("AE_TRACKING_ID", "").strip()
 AE_GATEWAY_LIST = [u.strip() for u in (os.getenv("AE_GATEWAY_LIST","").split(",") if os.getenv("AE_GATEWAY_LIST") else [])]
-AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY","").strip()  # optional deep_link fallback
+AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY","").strip()  # optional fallback
 
 # Timing
 POST_DELAY_SECONDS = int(os.getenv("POST_DELAY_SECONDS","12") or "12")
@@ -90,7 +89,7 @@ def pop_next_pending():
     keys = ["item_id","title","url","price","image_url","ts","aff_ok"]
     return dict(zip(keys, first + [""]*(len(keys)-len(first))))
 
-# ======= AliExpress: scraping fallback (for discovery only) =======
+# ======= AliExpress: discovery (scraping) =======
 _UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -101,7 +100,7 @@ def _sess():
     s.headers.update({"User-Agent": random.choice(_UA_LIST), "Accept-Language":"en-US,en;q=0.9"})
     return s
 
-def _fetch_html(url, s, timeout=(10,20)):
+def _fetch_html(url, s, timeout=(8,12)):
     r = s.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
     return r.text
@@ -117,7 +116,7 @@ def _parse_item_links(html):
 
 def _scrape_meta(url, s):
     try:
-        h = _fetch_html(url, s, timeout=(8,15))
+        h = _fetch_html(url, s, timeout=(6,10))
         title = None
         m = re.search(r'property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', h)
         if m: title = m.group(1)
@@ -133,7 +132,7 @@ def discover(query, limit=10):
     urls = [
         f"https://www.aliexpress.com/af/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc&page={p}" for p in [1,2,3]
     ] + [
-        f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60]
+        f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60,90]
     ]
     found = []
     for u in urls:
@@ -158,14 +157,10 @@ def discover(query, limit=10):
 
 # ======= Affiliate wrapping =======
 def _aliexpress_api_client():
-    """
-    Returns callable: get_affiliate_link(url) -> str|None using python-aliexpress-api if creds exist.
-    """
     if not (AE_APP_KEY and AE_APP_SECRET and AE_TRACKING_ID):
         return None
     try:
         from aliexpress_api import AliexpressApi, models
-        # Map language/currency safely
         lang_map = {k:getattr(models.Language,k) for k in dir(models.Language) if k.isupper()}
         cur_map  = {k:getattr(models.Currency,k) for k in dir(models.Currency) if k.isupper()}
         lang = lang_map.get(LANG, models.Language.EN)
@@ -179,13 +174,13 @@ def _aliexpress_api_client():
             except Exception as e:
                 print(f"[AEAPI][ERR] {e}", flush=True)
             return None
+        print("[AEAPI] Ready", flush=True)
         return make
     except Exception as e:
-        print(f"[AEAPI][WARN] python-aliexpress-api not available or failed: {e}", flush=True)
+        print(f"[AEAPI][WARN] {e}", flush=True)
         return None
 
 def _s_click_fallback(url: str):
-    # Requires aff_short_key from Portals (optional)
     if not AE_AFF_SHORT_KEY: 
         return None
     base = "https://s.click.aliexpress.com/deep_link.htm"
@@ -194,32 +189,30 @@ def _s_click_fallback(url: str):
 AFF_MAKER = _aliexpress_api_client()
 
 def to_affiliate(url: str):
-    """
-    Return (url, aff_ok). Obeys REQUIRE_AFFILIATE:
-    - Try official API (tracking id)
-    - Fallback to s.click deep_link if AFF short key exists
-    - If both fail: return original, aff_ok=False (and may be skipped later)
-    """
     u = (url or "").strip()
     if not u: return u, False
-    # 1) official API
     if AFF_MAKER:
         link = AFF_MAKER(u)
-        if link: return link, True
-    # 2) s.click fallback
+        if link: 
+            print(f"[AFF] API OK -> {link[:80]}...", flush=True)
+            return link, True
+        else:
+            print("[AFF] API FAIL", flush=True)
     link = _s_click_fallback(u)
-    if link: return link, True
-    # 3) nothing
+    if link: 
+        print(f"[AFF] s.click OK -> {link[:80]}...", flush=True)
+        return link, True
+    print("[AFF] NO-AFF", flush=True)
     return u, False
 
 # ======= UI =======
 CATS = [
-    ("gadgets","📱 גאדג'טים","gadgets electronic gadget"),
-    ("fashion_men","👔 אופנת גברים","men compression shorts running gym"),
-    ("fashion_women","👗 אופנת נשים","women leggings yoga gym"),
-    ("home_tools","🧰 כלי בית","home tools hardware screwdriver drill set"),
-    ("fitness","🏃 ספורט וכושר","fitness gear resistance band"),
-    ("beauty","💄 ביוטי","beauty makeup cosmetic"),
+    ("gadgets","📱 גאדג'טים",["gadgets electronic gadget", "smart gadget", "electronics accessories", "usb gadget"]),
+    ("fashion_men","👔 אופנת גברים",["men compression shorts running gym", "training tights men", "sportswear men"]),
+    ("fashion_women","👗 אופנת נשים",["women leggings yoga gym", "women sport leggings", "yoga pants women"]),
+    ("home_tools","🧰 כלי בית",["home tools hardware screwdriver drill set", "household tools set"]),
+    ("fitness","🏃 ספורט וכושר",["fitness gear resistance band", "gym accessories", "sports equipment"]),
+    ("beauty","💄 ביוטי",["beauty makeup cosmetic", "makeup brush set", "lipstick set"]),
 ]
 
 def build_menu():
@@ -249,7 +242,6 @@ def send_item(item, chat_id):
     text = format_post(item)
     url = (item.get("url") or "").strip()
     img = (item.get("image_url") or "").strip()
-    # Button explicitly marked as affiliate (minimal change to structure)
     btn_txt = "🛒 לקנייה עכשיו" + (" ✅ אפילייט" if item.get("aff_ok") in ("1",1,True) else "")
     kb = types.InlineKeyboardMarkup()
     if url: kb.add(types.InlineKeyboardButton(btn_txt, url=url))
@@ -296,44 +288,69 @@ def cmd_aff_test(m):
     bot.reply_to(m, f"{'✅' if ok else '⚠️ NO-AFF'}\n{aff}")
 
 # ======= Callbacks =======
+def _discover_many(queries, limit_each=6):
+    res = []
+    for q in queries:
+        items = discover(q, limit=limit_each)
+        res += items
+        if len(res) >= 12: break
+    return res[:12]
+
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
     try:
         data = c.data or ""
         if data == "cats":
-            bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats()); return
+            bot.answer_callback_query(c.id)
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats()); 
+            return
         if data == "back":
-            bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); return
+            bot.answer_callback_query(c.id)
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); 
+            return
         if data == "queue":
-            bot.answer_callback_query(c.id, f"בתור: {pending_count()}"); return
+            bot.answer_callback_query(c.id, f"בתור: {pending_count()}"); 
+            return
         if data == "on":
-            set_locked(False); bot.answer_callback_query(c.id,"🔌 הופעל"); return
+            set_locked(False); bot.answer_callback_query(c.id,"🔌 הופעל"); 
+            return
         if data == "off":
-            set_locked(True); bot.answer_callback_query(c.id,"🛑 כובה"); return
+            set_locked(True); bot.answer_callback_query(c.id,"🛑 כובה"); 
+            return
         if data == "post_now":
             if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
             item = pop_next_pending()
             if not item: return bot.answer_callback_query(c.id,"אין פריטים בתור", show_alert=True)
             send_item(item, TARGET_CHAT_ID or c.message.chat.id)
-            bot.answer_callback_query(c.id,"✅ פורסם"); return
+            bot.answer_callback_query(c.id,"✅ פורסם"); 
+            return
         if data.startswith("ae:"):
             if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
             cid = data.split(":",1)[1]
-            query = next((q for k,_,q in CATS if k==cid), cid)
-            items = discover(query, limit=12)
-            # Convert all to affiliate; enforce REQUIRE_AFFILIATE
-            affed = []
-            for it in items:
-                url_aff, ok = to_affiliate(it["url"])
-                it["url"] = url_aff
-                it["aff_ok"] = ok
-                if ok or not REQUIRE_AFFILIATE:
-                    affed.append(it)
-            if not affed:
-                bot.answer_callback_query(c.id, "לא נמצאו פריטים אפילייט, נסה שוב", show_alert=True); return
-            append_rows(affed)
-            bot.answer_callback_query(c.id, f"נוספו {len(affed)} (אפילייט)", show_alert=False)
-            bot.send_message(c.message.chat.id, f"✅ נוספו {len(affed)} פריטים אפילייט. בתור: {pending_count()}")
+            queries = next((qs for k,_,qs in CATS if k==cid), [cid])
+            # Respond immediately to avoid Telegram webhook timeout
+            try: bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
+            except Exception: pass
+            # Do heavy work in a short background thread so HTTP webhook response already acked
+            def work():
+                try:
+                    items = _discover_many(queries, limit_each=6)
+                    affed = []
+                    for it in items:
+                        url_aff, ok = to_affiliate(it["url"])
+                        it["url"] = url_aff
+                        it["aff_ok"] = ok
+                        if ok or not REQUIRE_AFFILIATE:
+                            affed.append(it)
+                    if not affed:
+                        bot.send_message(c.message.chat.id, "ℹ️ לא נמצאו פריטים אפילייט כרגע, נסה שוב.")
+                        return
+                    append_rows(affed)
+                    bot.send_message(c.message.chat.id, f"✅ נוספו {len(affed)} פריטים אפילייט. בתור: {pending_count()}")
+                except Exception as e:
+                    bot.send_message(c.message.chat.id, f"שגיאה בשאיבה: {e}")
+            threading.Thread(target=work, daemon=True).start()
+            return
     except Exception as e:
         try: bot.answer_callback_query(c.id, f"שגיאה: {e}")
         except Exception: pass
@@ -341,19 +358,33 @@ def on_cb(c):
 # ======= Webhook endpoints =======
 @app.route("/webhook/<secret>", methods=["POST"])
 def webhook(secret):
-    if secret != WEBHOOK_SECRET: return "forbidden", 403
-    upd = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-    bot.process_new_updates([upd])
+    if secret != WEBHOOK_SECRET: 
+        return "forbidden", 403
+    payload = request.get_data(as_text=True) or ""
+    # Process in background to ACK immediately (prevents Telegram 502)
+    def worker(data_text: str):
+        try:
+            upd = telebot.types.Update.de_json(data_text)
+            bot.process_new_updates([upd])
+        except Exception as e:
+            print(f"[WH][ERR] {e}", flush=True)
+    threading.Thread(target=worker, args=(payload,), daemon=True).start()
+    return "OK", 200
+
+@app.route("/_health", methods=["GET"])
+def health():
     return "OK", 200
 
 @app.route("/", methods=["GET"])
-def root(): return "OK", 200
+def root(): 
+    return "OK", 200
 
 def setup_webhook():
     if not USE_WEBHOOK: 
         print("[WH] USE_WEBHOOK=0 -> webhook disabled"); return
     try:
-        print("getWebhookInfo:", bot.get_webhook_info())
+        info = bot.get_webhook_info()
+        print("getWebhookInfo:", info)
         bot.delete_webhook()
     except Exception as e:
         print(f"[WH] delete_webhook: {e}")
