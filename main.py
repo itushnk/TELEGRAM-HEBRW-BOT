@@ -28,6 +28,11 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_CSV = DATA_DIR / "pending.csv"
 LOCK_PATH = DATA_DIR / "bot.lock"
 
+# Affiliate envs
+AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY", "").strip()  # from AliExpress Portals
+AFF_DEEPLINK_PREFIX = os.getenv("AFF_DEEPLINK_PREFIX", "").strip()  # e.g., https://ad.admitad.com/g/XXXXX/?ulp=
+# Order: AE_AFF_SHORT_KEY > AFF_DEEPLINK_PREFIX > original link
+
 # ========= BOT/WEB =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
@@ -73,7 +78,9 @@ def append_to_pending(rows):
     with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for r in rows:
-            w.writerow([r.get("id",""), r.get("title",""), r.get("url",""), r.get("price",""), r.get("image_url",""), int(time.time())])
+            # wrap affiliate here
+            url = to_affiliate(r.get("url",""))
+            w.writerow([r.get("id",""), r.get("title",""), url, r.get("price",""), r.get("image_url",""), int(time.time())])
 
 def pending_count() -> int:
     if not PENDING_CSV.exists():
@@ -102,6 +109,26 @@ def pop_next_pending():
     keys = ["item_id","title","url","price","image_url","ts"]
     item = dict(zip(keys, item_row + [""]*(len(keys)-len(item_row))))
     return item
+
+# ================= Affiliate wrapper ==================
+def to_affiliate(url: str) -> str:
+    try:
+        u = (url or "").strip()
+        if not u:
+            return u
+        # 1) AliExpress Portals deep link
+        if AE_AFF_SHORT_KEY:
+            base = "https://s.click.aliexpress.com/deep_link.htm"
+            return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(u)}"
+        # 2) Generic aggregator deep link (e.g., Admitad)
+        if AFF_DEEPLINK_PREFIX:
+            # Expect prefix ends with ?ulp= or ?u= ... we just append encoded URL
+            return f"{AFF_DEEPLINK_PREFIX}{quote_plus(u)}"
+        # 3) Original
+        return u
+    except Exception as e:
+        print(f"[AFF][WARN] wrap failed: {e}", flush=True)
+        return url
 
 # ================= AliExpress Fallbacks ==================
 _UA_LIST = [
@@ -143,7 +170,7 @@ def _parse_item_links_from_html(html):
 
 def _scrape_item_meta(url, sess):
     try:
-        h = _fetch_html(url, sess, timeout=(10,20))
+        h = _fetch_html(url, sess, timeout=(8,15))
         # title
         title = None
         m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,200})["\']', h, re.I)
@@ -166,36 +193,46 @@ def _scrape_item_meta(url, sess):
         print(f"[AE][META][WARN] {url} -> {e}", flush=True)
         return None
 
-def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
+def _paged_urls_for_query(query: str):
     q = quote_plus(query)
-    urls = [
-        f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc",
-        f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
-        f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc",
-    ]
+    pages = [1,2,3]  # try up to 3 pages to diversify
+    random.shuffle(pages)
+    urls = []
+    for p in pages:
+        urls.append(f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc&page={p}")
+        urls.append(f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc&page={p}")
+    # mobile last
+    urls.append(f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc")
+    return urls
+
+def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
     sess = _sess()
     total = []
-    # pass 1: try aliexpress search pages
-    for url in urls:
+    # pass 1: try aliexpress with pagination & random UAs
+    for url in _paged_urls_for_query(query):
         try:
             html = _fetch_html(url, sess)
             links = _parse_item_links_from_html(html)
-            total.extend(links)
+            if links:
+                total.extend(links)
         except Exception as e:
             print(f"[AE][FALLBACK][WARN] {url} -> {e}", flush=True)
-    # if empty, pass 2: duckduckgo site search
-    if not total:
+        if len(total) >= limit*2:  # collect a bit extra before meta
+            break
+
+    # pass 2: search engine fallback if still weak
+    if len(total) < limit:
         try:
+            offset = random.choice([0, 30, 60, 90])
             ddg_q = quote_plus(f"site:aliexpress.com/item {query}")
-            ddg_url = f"https://duckduckgo.com/html/?q={ddg_q}"
-            html = _fetch_html(ddg_url, sess, timeout=(10,20))
+            ddg_url = f"https://duckduckgo.com/html/?q={ddg_q}&s={offset}"
+            html = _fetch_html(ddg_url, sess, timeout=(8,15))
             links = _parse_item_links_from_html(html)
             total.extend(links)
-            if not links:
-                # try m.aliexpress on duckduckgo too
+            if len(total) < limit:
                 ddg_q2 = quote_plus(f"site:m.aliexpress.com/item {query}")
-                ddg_url2 = f"https://duckduckgo.com/html/?q={ddg_q2}"
-                html2 = _fetch_html(ddg_url2, sess, timeout=(10,20))
+                ddg_url2 = f"https://duckduckgo.com/html/?q={ddg_q2}&s={offset}"
+                html2 = _fetch_html(ddg_url2, sess, timeout=(8,15))
                 links2 = _parse_item_links_from_html(html2)
                 total.extend(links2)
         except Exception as e:
@@ -342,7 +379,7 @@ def cmd_clear_pending(m):
     except Exception as e:
         bot.reply_to(m, f"שגיאה במחיקה: {e}")
 
-# ---- NEW: test AE ----
+# ---- Debug: test AE / test affiliate ----
 @bot.message_handler(commands=["test_ae"])
 def cmd_test_ae(m):
     parts = (m.text or "").split(None, 1)
@@ -356,6 +393,15 @@ def cmd_test_ae(m):
         return
     preview = "\n".join([f"- {it['title'][:60]}…" for it in items[:5]])
     bot.reply_to(m, f"נמצאו {len(items)} פריטים עבור: {query}\n{preview}")
+
+@bot.message_handler(commands=["aff_test"])
+def cmd_aff_test(m):
+    parts = (m.text or "").split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(m, "שימוש: /aff_test <url>")
+        return
+    url = parts[1].strip()
+    bot.reply_to(m, to_affiliate(url))
 
 # ======= Callbacks =======
 @bot.callback_query_handler(func=lambda c: True)
@@ -390,12 +436,12 @@ def on_cb(c):
             bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
             # map to simple query keywords
             qmap = {
-                "gadgets":"gadgets",
-                "fashion_men":"men compression shorts",
-                "fashion_women":"women leggings",
-                "home_tools":"home tools",
-                "fitness":"fitness gear",
-                "beauty":"beauty makeup"
+                "gadgets":"gadgets electronic gadget",
+                "fashion_men":"men compression shorts running gym",
+                "fashion_women":"women leggings yoga gym",
+                "home_tools":"home tools hardware screwdriver drill set",
+                "fitness":"fitness gear resistance band",
+                "beauty":"beauty makeup cosmetic"
             }
             query = qmap.get(cat, cat)
             items = ae_fallback_search(query, limit=8, ship_to="IL")
