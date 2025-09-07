@@ -1,7 +1,16 @@
-קובץ זה כולל את הקוד המלא של הבוט כולל שיפורי תרגום וטעינת CSV:
-- העלה קובץ CSV עם העמודות הקבועות (כולל Product Desc, Opening, Title, Strengths).
-- הבוט יתרגם אוטומטית שורות שלא כוללות טקסט בשדות Opening, Title, Strengths.
-- לאחר מכן הפוסטים יישלחו לפי ההגדרות שלך.
+# Hebrew AliExpress Bot (webhook, affiliate-enforced)
 
-הקפד להגדיר את משתנה הסביבה OPENAI_API_KEY כראוי ב־Railway.
-יש להגדיר גם את משתני הסביבה BOT_TOKEN (אסימון הגישה לבוט בטלגרם) ו-PUBLIC_CHANNEL (הערוץ הציבורי שבו יפורסמו הפוסטים).
+## ENV you mentioned
+- AE_API_APP_KEY, AE_APP_SECRET, AE_TRACKING_ID, AE_GATEWAY_LIST (optional for library)
+- AE_SHIP_TO_COUNTRY, AE_TARGET_CURRENCY, AE_TARGET_LANGUAGE
+- BOT_TOKEN (or TELEGRAM_BOT_TOKEN)
+- TELEGRAM_WEBHOOK_BASE (e.g. https://your-app.up.railway.app)
+- TELEGRAM_WEBHOOK_SECRET (e.g. some-strong-secret)
+- USE_WEBHOOK=1
+- PUBLIC_CHANNEL (optional, numeric id like -100xxxxxxxxxx)
+- POST_DELAY_SECONDS (optional)
+- REQUIRE_AFFILIATE=1 (default, only add to queue if affiliate conversion succeeded)
+
+## Verify affiliate
+- Use /aff_test <url> — will return ✅ or ⚠️ NO-AFF and the final link.
+- On posts, the button text shows “✅ אפילייט” when the link is affiliate-tagged.

@@ -1,43 +1,53 @@
 # -*- coding: utf-8 -*-
-import os, time, json, csv, re, random
+"""
+Telegram bot (webhook) that queues and posts AliExpress products.
+This build *enforces affiliate-only links* when AE_API_APP_KEY/AE_APP_SECRET/AE_TRACKING_ID are set.
+If conversion fails and REQUIRE_AFFILIATE=1, the item is skipped.
+"""
+import os, time, csv, random, re
 from pathlib import Path
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import quote_plus
 import requests
 import telebot
 from telebot import types
 from flask import Flask, request
 
-# ========= ENV =========
+# ======= ENV / CONFIG =======
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
-if not BOT_TOKEN:
-    print("[INIT][WARN] Missing TELEGRAM_BOT_TOKEN/BOT_TOKEN", flush=True)
-
-WEBHOOK_URL = os.getenv("TELEGRAM_WEBHOOK_URL") or ""
-WEBHOOK_BASE = os.getenv("TELEGRAM_WEBHOOK_BASE") or os.getenv("WEBHOOK_BASE") or ""
-RAILWAY_DOMAIN = os.getenv("RAILWAY_STATIC_URL") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or ""
-RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") or ""
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+TELEGRAM_WEBHOOK_BASE = (os.getenv("TELEGRAM_WEBHOOK_BASE") or "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET") or "secret"
+USE_WEBHOOK = os.getenv("USE_WEBHOOK","1") == "1"
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # e.g. -100...
+TARGET_CHAT_ID = int(PUBLIC_CHANNEL) if PUBLIC_CHANNEL.lstrip("-").isdigit() else None
+CURRENCY = os.getenv("AE_TARGET_CURRENCY", "₪")
+SHIP_TO = os.getenv("AE_SHIP_TO_COUNTRY", "IL")
+LANG = (os.getenv("AE_TARGET_LANGUAGE", "EN") or "EN").upper()
+REQUIRE_AFFILIATE = os.getenv("REQUIRE_AFFILIATE","1") == "1"
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # optional, 0 = disabled
-CURRENCY = os.getenv("CURRENCY", "₪")
-TARGET_CHAT_ID_ENV = os.getenv("TARGET_CHAT_ID", "").strip()  # channel/group id (e.g., -1001234567890)
-TARGET_CHAT_ID = int(TARGET_CHAT_ID_ENV) if TARGET_CHAT_ID_ENV and TARGET_CHAT_ID_ENV.lstrip("-").isdigit() else None
+# Affiliate API creds (Open Platform | Portals)
+AE_APP_KEY = os.getenv("AE_API_APP_KEY", "").strip()
+AE_APP_SECRET = os.getenv("AE_APP_SECRET", "").strip()
+AE_TRACKING_ID = os.getenv("AE_TRACKING_ID", "").strip()  # sometimes called 'pid' or 'trackingId'
+AE_GATEWAY_LIST = [u.strip() for u in (os.getenv("AE_GATEWAY_LIST","").split(",") if os.getenv("AE_GATEWAY_LIST") else [])]
+AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY","").strip()  # optional deep_link fallback
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+# Timing
+POST_DELAY_SECONDS = int(os.getenv("POST_DELAY_SECONDS","12") or "12")
+
+# Storage
+DATA_DIR = Path(os.getenv("DATA_DIR","data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 PENDING_CSV = DATA_DIR / "pending.csv"
 LOCK_PATH = DATA_DIR / "bot.lock"
 
-# Affiliate envs
-AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY", "").strip()  # from AliExpress Portals
-AFF_DEEPLINK_PREFIX = os.getenv("AFF_DEEPLINK_PREFIX", "").strip()  # e.g., https://ad.admitad.com/g/XXXXX/?ulp=
-# Order: AE_AFF_SHORT_KEY > AFF_DEEPLINK_PREFIX > original link
-
-# ========= BOT/WEB =========
+# ======= Bot / Web =======
+if not BOT_TOKEN:
+    print("[BOOT][ERR] Missing bot token", flush=True)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# ========= HELPERS =========
+# ======= Helpers (lock & queue) =======
 def is_locked() -> bool:
     return LOCK_PATH.exists()
 
@@ -49,458 +59,325 @@ def set_locked(val: bool) -> None:
             if LOCK_PATH.exists():
                 LOCK_PATH.unlink()
     except Exception as e:
-        print(f"[ERR] set_locked: {e}", flush=True)
-
-def compute_webhook_url() -> str:
-    if WEBHOOK_URL:
-        return WEBHOOK_URL
-    host = ""
-    if WEBHOOK_BASE:
-        host = WEBHOOK_BASE.strip().rstrip("/")
-    elif RAILWAY_DOMAIN:
-        host = RAILWAY_DOMAIN.strip().rstrip("/")
-        if not host.startswith("http"):
-            host = "https://" + host
-    elif RENDER_URL:
-        host = RENDER_URL.strip().rstrip("/")
-    if host:
-        return f"{host}/webhook/{WEBHOOK_SECRET}"
-    return ""
+        print(f"[WARN] set_locked: {e}", flush=True)
 
 def ensure_pending_csv():
     if not PENDING_CSV.exists():
         with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["item_id","title","url","price","image_url","ts"])
+            csv.writer(f)..writerow(["item_id","title","url","price","image_url","ts","aff_ok"])
 
-def append_to_pending(rows):
+def pending_count():
+    if not PENDING_CSV.exists(): return 0
+    with PENDING_CSV.open("r", encoding="utf-8") as f:
+        return max(0, sum(1 for _ in f)-1)
+
+def append_rows(rows):
     ensure_pending_csv()
     with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         for r in rows:
-            # wrap affiliate here
-            url = to_affiliate(r.get("url",""))
-            w.writerow([r.get("id",""), r.get("title",""), url, r.get("price",""), r.get("image_url",""), int(time.time())])
-
-def pending_count() -> int:
-    if not PENDING_CSV.exists():
-        return 0
-    with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
-        return max(0, sum(1 for _ in f) - 1)
+            w.writerow([r.get("id",""), r.get("title",""), r.get("url",""), r.get("price",""), r.get("image_url",""), int(time.time()), "1" if r.get("aff_ok") else "0"])
 
 def pop_next_pending():
-    """Pop first item row from pending.csv (FIFO). Returns dict or None."""
-    if not PENDING_CSV.exists():
-        return None
-    rows = []
+    if not PENDING_CSV.exists(): return None
     with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        rows = list(reader)
-    if len(rows) <= 1:
-        return None
-    header = rows[0]
-    item_row = rows[1]
-    # rewrite minus the first data row
+        rows = list(csv.reader(f))
+    if len(rows) <= 1: return None
+    header, first, rest = rows[0], rows[1], rows[2:]
     with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for r in rows[2:]:
-            w.writerow(r)
-    keys = ["item_id","title","url","price","image_url","ts"]
-    item = dict(zip(keys, item_row + [""]*(len(keys)-len(item_row))))
-    return item
+        w = csv.writer(f); w.writerow(header); [w.writerow(r) for r in rest]
+    keys = ["item_id","title","url","price","image_url","ts","aff_ok"]
+    return dict(zip(keys, first + [""]*(len(keys)-len(first))))
 
-# ================= Affiliate wrapper ==================
-def to_affiliate(url: str) -> str:
-    try:
-        u = (url or "").strip()
-        if not u:
-            return u
-        # 1) AliExpress Portals deep link
-        if AE_AFF_SHORT_KEY:
-            base = "https://s.click.aliexpress.com/deep_link.htm"
-            return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(u)}"
-        # 2) Generic aggregator deep link (e.g., Admitad)
-        if AFF_DEEPLINK_PREFIX:
-            # Expect prefix ends with ?ulp= or ?u= ... we just append encoded URL
-            return f"{AFF_DEEPLINK_PREFIX}{quote_plus(u)}"
-        # 3) Original
-        return u
-    except Exception as e:
-        print(f"[AFF][WARN] wrap failed: {e}", flush=True)
-        return url
-
-# ================= AliExpress Fallbacks ==================
+# ======= AliExpress: scraping fallback (for discovery only) =======
 _UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
 ]
-
 def _sess():
     s = requests.Session()
-    s.headers.update({
-        "User-Agent": random.choice(_UA_LIST),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Connection": "keep-alive",
-        "Referer": "https://www.aliexpress.com/"
-    })
+    s.headers.update({"User-Agent": random.choice(_UA_LIST), "Accept-Language":"en-US,en;q=0.9"})
     return s
 
-def _fetch_html(url, sess, timeout=(10,20)):
-    r = sess.get(url, timeout=timeout, allow_redirects=True)
+def _fetch_html(url, s, timeout=(10,20)):
+    r = s.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
-    if "AliExpress.com - Maintaining" in r.text[:200] or "center/maintain" in r.url:
-        raise RuntimeError("maintenance page")
     return r.text
 
-def _parse_item_links_from_html(html):
-    items = []
-    for m in re.finditer(r'https?://(?:www|m)\.aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', html):
-        url = m.group(0)
-        pid = m.group(1)
-        items.append({"id": pid, "url": url})
-    # dedup
+def _parse_item_links(html):
     out, seen = [], set()
-    for it in items:
-        if it["id"] in seen: continue
-        seen.add(it["id"]); out.append(it)
+    for m in re.finditer(r'https?://(?:www|m)\.aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', html):
+        url, pid = m.group(0), m.group(1)
+        if url in seen: continue
+        seen.add(url)
+        out.append({"id": pid, "url": url})
     return out
 
-def _scrape_item_meta(url, sess):
+def _scrape_meta(url, s):
     try:
-        h = _fetch_html(url, sess, timeout=(8,15))
-        # title
+        h = _fetch_html(url, s, timeout=(8,15))
         title = None
-        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,200})["\']', h, re.I)
+        m = re.search(r'property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', h)
         if m: title = m.group(1)
-        if not title:
-            m = re.search(r'<title>\s*([^<]{5,200})\s*</title>', h, re.I)
-            if m: title = m.group(1)
-        # image
+        m = re.search(r'<title>\s*([^<]+)\s*</title>', h);  title = title or (m.group(1) if m else None)
         img = None
-        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h, re.I)
-        if m: img = m.group(1)
-        return {
-            "id": re.search(r'(\d{8,})\.html', url).group(1) if re.search(r'(\d{8,})\.html', url) else str(abs(hash(url))),
-            "title": title or "AliExpress product",
-            "url": url,
-            "image_url": img or "",
-            "price": ""
-        }
+        m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h);  img = m.group(1) if m else None
+        return {"id": re.search(r'(\d{8,})\.html', url).group(1), "title": title or "AliExpress product", "url": url, "image_url": img or "", "price": ""}
     except Exception as e:
-        print(f"[AE][META][WARN] {url} -> {e}", flush=True)
-        return None
+        print(f"[META][WARN] {url} -> {e}", flush=True); return None
 
-def _paged_urls_for_query(query: str):
-    q = quote_plus(query)
-    pages = [1,2,3]  # try up to 3 pages to diversify
-    random.shuffle(pages)
-    urls = []
-    for p in pages:
-        urls.append(f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc&page={p}")
-        urls.append(f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc&page={p}")
-    # mobile last
-    urls.append(f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc")
-    return urls
-
-def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
-    sess = _sess()
-    total = []
-    # pass 1: try aliexpress with pagination & random UAs
-    for url in _paged_urls_for_query(query):
+def discover(query, limit=10):
+    s = _sess()
+    urls = [
+        f"https://www.aliexpress.com/af/{quote_plus(query)}.html?g=y&SortType=total_tranpro_desc&page={p}" for p in [1,2,3]
+    ] + [
+        f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60]
+    ]
+    found = []
+    for u in urls:
         try:
-            html = _fetch_html(url, sess)
-            links = _parse_item_links_from_html(html)
-            if links:
-                total.extend(links)
+            html = _fetch_html(u, s)
+            found += _parse_item_links(html)
+            if len(found) >= limit*2: break
         except Exception as e:
-            print(f"[AE][FALLBACK][WARN] {url} -> {e}", flush=True)
-        if len(total) >= limit*2:  # collect a bit extra before meta
-            break
-
-    # pass 2: search engine fallback if still weak
-    if len(total) < limit:
-        try:
-            offset = random.choice([0, 30, 60, 90])
-            ddg_q = quote_plus(f"site:aliexpress.com/item {query}")
-            ddg_url = f"https://duckduckgo.com/html/?q={ddg_q}&s={offset}"
-            html = _fetch_html(ddg_url, sess, timeout=(8,15))
-            links = _parse_item_links_from_html(html)
-            total.extend(links)
-            if len(total) < limit:
-                ddg_q2 = quote_plus(f"site:m.aliexpress.com/item {query}")
-                ddg_url2 = f"https://duckduckgo.com/html/?q={ddg_q2}&s={offset}"
-                html2 = _fetch_html(ddg_url2, sess, timeout=(8,15))
-                links2 = _parse_item_links_from_html(html2)
-                total.extend(links2)
-        except Exception as e:
-            print(f"[AE][DDG][WARN] ddg -> {e}", flush=True)
-
-    # build items with meta (title/image)
-    uniq_urls, seen = [], set()
-    for it in total:
-        u = it["url"]
-        if u in seen: continue
-        seen.add(u); uniq_urls.append(u)
-        if len(uniq_urls) >= limit: break
-
+            print(f"[DISCOVER][WARN] {u} -> {e}", flush=True)
+    uniq = []
+    seen = set()
+    for it in found:
+        if it["url"] in seen: continue
+        seen.add(it["url"]); uniq.append(it["url"])
+        if len(uniq) >= limit: break
     items = []
-    for u in uniq_urls:
-        meta = _scrape_item_meta(u, sess)
-        if meta: items.append(meta)
-
-    print(f"[AE][FALLBACK] query='{query}' -> {len(items)} items", flush=True)
+    for u in uniq:
+        m = _scrape_meta(u, s)
+        if m: items.append(m)
+    print(f"[DISCOVER] '{query}' -> {len(items)} items", flush=True)
     return items
 
+# ======= Affiliate wrapping =======
+def _aliexpress_api_client():
+    """
+    Returns callable: get_affiliate_link(url) -> str|None using python-aliexpress-api if creds exist.
+    """
+    if not (AE_APP_KEY and AE_APP_SECRET and AE_TRACKING_ID):
+        return None
+    try:
+        from aliexpress_api import AliexpressApi, models
+        # Map language/currency safely
+        lang_map = {k:getattr(models.Language,k) for k in dir(models.Language) if k.isupper()}
+        cur_map  = {k:getattr(models.Currency,k) for k in dir(models.Currency) if k.isupper()}
+        lang = lang_map.get(LANG, models.Language.EN)
+        cur  = cur_map.get(CURRENCY.upper(), models.Currency.USD)
+        api = AliexpressApi(AE_APP_KEY, AE_APP_SECRET, lang, cur, AE_TRACKING_ID, session=None)
+        def make(url: str) -> str|None:
+            try:
+                links = api.get_affiliate_links(url)
+                if links and getattr(links[0], "promotion_link", None):
+                    return links[0].promotion_link
+            except Exception as e:
+                print(f"[AEAPI][ERR] {e}", flush=True)
+            return None
+        return make
+    except Exception as e:
+        print(f"[AEAPI][WARN] python-aliexpress-api not available or failed: {e}", flush=True)
+        return None
+
+def _s_click_fallback(url: str) -> str|None:
+    # Requires aff_short_key from Portals (optional)
+    if not AE_AFF_SHORT_KEY: 
+        return None
+    base = "https://s.click.aliexpress.com/deep_link.htm"
+    return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(url)}"
+
+AFF_MAKER = _aliexpress_api_client()
+
+def to_affiliate(url: str) -> tuple[str,bool]:
+    """
+    Return (url, aff_ok). Obeys REQUIRE_AFFILIATE:
+    - Try official API (tracking id)
+    - Fallback to s.click deep_link if AFF short key exists
+    - If both fail: return original, aff_ok=False (and may be skipped later)
+    """
+    u = (url or "").strip()
+    if not u: return u, False
+    # 1) official API
+    if AFF_MAKER:
+        link = AFF_MAKER(u)
+        if link: return link, True
+    # 2) s.click fallback
+    link = _s_click_fallback(u)
+    if link: return link, True
+    # 3) nothing
+    return u, False
+
 # ======= UI =======
-CATEGORIES = [
-    ("gadgets", "📱 גאדג'טים"),
-    ("fashion_men", "👔 אופנת גברים"),
-    ("fashion_women", "👗 אופנת נשים"),
-    ("home_tools", "🧰 כלי בית"),
-    ("fitness", "🏃 ספורט וכושר"),
-    ("beauty", "💄 ביוטי"),
+CATS = [
+    ("gadgets","📱 גאדג'טים","gadgets electronic gadget"),
+    ("fashion_men","👔 אופנת גברים","men compression shorts running gym"),
+    ("fashion_women","👗 אופנת נשים","women leggings yoga gym"),
+    ("home_tools","🧰 כלי בית","home tools hardware screwdriver drill set"),
+    ("fitness","🏃 ספורט וכושר","fitness gear resistance band"),
+    ("beauty","💄 ביוטי","beauty makeup cosmetic"),
 ]
 
 def build_menu():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(types.InlineKeyboardButton("🚀 פרסם עכשיו", callback_data="post_now"))
-    kb.add(types.InlineKeyboardButton("🛒 שאיבה לפי קטגוריות", callback_data="cats"),
-           types.InlineKeyboardButton("📜 מצב תור", callback_data="queue"))
+    kb.add(types.InlineKeyboardButton("🛒 שאיבה לפי קטגוריות", callback_data="cats"))
+    kb.add(types.InlineKeyboardButton("🚀 פרסם עכשיו", callback_data="post_now"),
+           types.InlineKeyboardButton("📥 מצב תור", callback_data="queue"))
     kb.add(types.InlineKeyboardButton("🔌 הפעלה", callback_data="on"),
            types.InlineKeyboardButton("🛑 כיבוי", callback_data="off"))
     return kb
 
-def build_categories():
+def build_cats():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    for cid, label in CATEGORIES:
-        kb.add(types.InlineKeyboardButton(label, callback_data=f"ae_cat:{cid}"))
+    for cid, label, _ in CATS:
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"ae:{cid}"))
     kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="back"))
     return kb
 
-def format_post(item: dict) -> str:
+def format_post(item):
     title = (item.get("title") or "").strip()
-    url = (item.get("url") or "").strip()
     price = (item.get("price") or "").strip()
-    # שמור על טקסט נקי בעברית + קריאה לפעולה
-    parts = [f"🛍️ {title}"]
-    if price:
-        parts.append(f"💰 מחיר: {price} {CURRENCY}".strip())
-    parts.append("👉 לחץ להזמנה בקישור מטה")
-    return "\n\n".join(parts), url
+    parts = [f"🛍️ {title}", "👉 לחץ להזמנה בקישור מטה"]
+    if price: parts.insert(1, f"💰 מחיר: {price} {CURRENCY}".strip())
+    return "\n\n".join(parts)
 
-def send_item(item: dict, chat_id: int):
-    text, url = format_post(item)
+def send_item(item, chat_id):
+    text = format_post(item)
+    url = (item.get("url") or "").strip()
     img = (item.get("image_url") or "").strip()
+    # Button explicitly marked as affiliate (minimal change to structure)
+    btn_txt = "🛒 לקנייה עכשיו" + (" ✅ אפילייט" if item.get("aff_ok") in ("1",1,True) else "")
     kb = types.InlineKeyboardMarkup()
-    if url:
-        kb.add(types.InlineKeyboardButton("🛒 לקנייה עכשיו", url=url))
-    if img:
-        try:
+    if url: kb.add(types.InlineKeyboardButton(btn_txt, url=url))
+    try:
+        if img:
             bot.send_photo(chat_id, img, caption=text, reply_markup=kb)
-            return
-        except Exception as e:
-            print(f"[POST][WARN] send_photo failed: {e}", flush=True)
-    bot.send_message(chat_id, text, reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, reply_markup=kb)
+    except Exception as e:
+        bot.send_message(chat_id, text + "\n\n(תמונה לא נשלחה)", reply_markup=kb)
 
 # ======= Commands =======
 @bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
-    state = "כבוי" if is_locked() else "פעיל"
-    bot.reply_to(m, f"שלום! מצב בוט: <b>{state}</b>", reply_markup=build_menu())
+    bot.reply_to(m, f"שלום! מצב: {'כבוי' if is_locked() else 'פעיל'}", reply_markup=build_menu())
 
 @bot.message_handler(commands=["on"])
 def cmd_on(m):
-    set_locked(False)
-    bot.reply_to(m, "🔌 הבוט הופעל", reply_markup=build_menu())
+    set_locked(False); bot.reply_to(m, "🔌 הופעל", reply_markup=build_menu())
 
 @bot.message_handler(commands=["off"])
 def cmd_off(m):
-    set_locked(True)
-    bot.reply_to(m, "🛑 הבוט כובה", reply_markup=build_menu())
+    set_locked(True); bot.reply_to(m, "🛑 כובה", reply_markup=build_menu())
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m):
-    bot.reply_to(m, f"📥 פריטים ממתינים: {pending_count()} | מצב בוט: {'כבוי' if is_locked() else 'פעיל'}")
-
-@bot.message_handler(commands=["here"])
-def cmd_here(m):
-    bot.reply_to(m, f"chat_id: <code>{m.chat.id}</code>")
+    bot.reply_to(m, f"📥 בתור: {pending_count()} | מצב: {'כבוי' if is_locked() else 'פעיל'}")
 
 @bot.message_handler(commands=["post"])
 def cmd_post(m):
-    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
-        bot.reply_to(m, "⛔ אין הרשאה לביצוע הפעולה הזו.")
-        return
-    if is_locked():
-        bot.reply_to(m, "הבוט כבוי.")
-        return
+    if is_locked(): return bot.reply_to(m,"הבוט כבוי.")
     item = pop_next_pending()
-    if not item:
-        bot.reply_to(m, "אין פריטים בתור.")
-        return
+    if not item: return bot.reply_to(m, "אין פריטים בתור.")
     target = TARGET_CHAT_ID or m.chat.id
     send_item(item, target)
-    bot.reply_to(m, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
-
-# ---- Admin utilities ----
-@bot.message_handler(commands=["dump_pending"])
-def cmd_dump_pending(m):
-    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
-        bot.reply_to(m, "⛔ אין הרשאה לפקודה זו.")
-        return
-    ensure_pending_csv()
-    try:
-        if not PENDING_CSV.exists() or pending_count() == 0:
-            bot.reply_to(m, "אין פריטים בתור.")
-            return
-        with PENDING_CSV.open("rb") as f:
-            bot.send_document(m.chat.id, f, visible_file_name="pending.csv", caption=f"📥 תור נוכחי: {pending_count()} פריטים")
-    except Exception as e:
-        bot.reply_to(m, f"שגיאה בשליחה: {e}")
-
-@bot.message_handler(commands=["clear_pending"])
-def cmd_clear_pending(m):
-    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
-        bot.reply_to(m, "⛔ אין הרשאה לפקודה זו.")
-        return
-    if not PENDING_CSV.exists():
-        bot.reply_to(m, "לא קיים תור למחיקה.")
-        return
-    count_before = pending_count()
-    ensure_pending_csv()
-    try:
-        with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["item_id","title","url","price","image_url","ts"])
-        bot.reply_to(m, f"🧹 נמחקו {count_before} פריטים מהתור.")
-    except Exception as e:
-        bot.reply_to(m, f"שגיאה במחיקה: {e}")
-
-# ---- Debug: test AE / test affiliate ----
-@bot.message_handler(commands=["test_ae"])
-def cmd_test_ae(m):
-    parts = (m.text or "").split(None, 1)
-    if len(parts) < 2:
-        bot.reply_to(m, "שימוש: /test_ae <שאילתא>, לדוגמה: /test_ae gadgets")
-        return
-    query = parts[1].strip()
-    items = ae_fallback_search(query, limit=10, ship_to="IL")
-    if not items:
-        bot.reply_to(m, f"לא נמצאו פריטים עבור: {query}")
-        return
-    preview = "\n".join([f"- {it['title'][:60]}…" for it in items[:5]])
-    bot.reply_to(m, f"נמצאו {len(items)} פריטים עבור: {query}\n{preview}")
+    bot.reply_to(m, f"✅ פורסם. נותרו: {pending_count()}")
 
 @bot.message_handler(commands=["aff_test"])
 def cmd_aff_test(m):
-    parts = (m.text or "").split(None, 1)
-    if len(parts) < 2:
-        bot.reply_to(m, "שימוש: /aff_test <url>")
-        return
-    url = parts[1].strip()
-    bot.reply_to(m, to_affiliate(url))
+    parts = (m.text or "").split(None,1)
+    if len(parts)<2: return bot.reply_to(m,"שימוש: /aff_test <url>")
+    u = parts[1].strip()
+    aff, ok = to_affiliate(u)
+    bot.reply_to(m, f"{'✅' if ok else '⚠️ NO-AFF'}\n{aff}")
 
 # ======= Callbacks =======
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
     try:
         data = c.data or ""
-        if data == "on":
-            set_locked(False); bot.answer_callback_query(c.id, "🔌 הופעל"); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); return
-        if data == "off":
-            set_locked(True); bot.answer_callback_query(c.id, "🛑 כובה"); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); return
-        if data == "queue":
-            bot.answer_callback_query(c.id, f"בתור: {pending_count()}"); return
         if data == "cats":
-            bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_categories()); return
+            bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats()); return
         if data == "back":
             bot.answer_callback_query(c.id); bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu()); return
+        if data == "queue":
+            bot.answer_callback_query(c.id, f"בתור: {pending_count()}"); return
+        if data == "on":
+            set_locked(False); bot.answer_callback_query(c.id,"🔌 הופעל"); return
+        if data == "off":
+            set_locked(True); bot.answer_callback_query(c.id,"🛑 כובה"); return
         if data == "post_now":
-            if is_locked():
-                bot.answer_callback_query(c.id, "הבוט כבוי.", show_alert=True); return
+            if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
             item = pop_next_pending()
-            if not item:
-                bot.answer_callback_query(c.id, "אין פריטים בתור", show_alert=True); return
-            target = TARGET_CHAT_ID or c.message.chat.id
-            send_item(item, target)
-            bot.answer_callback_query(c.id, "✅ פורסם")
-            bot.send_message(c.message.chat.id, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
-            return
-        if data.startswith("ae_cat:"):
-            if is_locked():
-                bot.answer_callback_query(c.id, "הבוט כבוי.", show_alert=True); return
-            cat = data.split(":",1)[1]
-            bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
-            # map to simple query keywords
-            qmap = {
-                "gadgets":"gadgets electronic gadget",
-                "fashion_men":"men compression shorts running gym",
-                "fashion_women":"women leggings yoga gym",
-                "home_tools":"home tools hardware screwdriver drill set",
-                "fitness":"fitness gear resistance band",
-                "beauty":"beauty makeup cosmetic"
-            }
-            query = qmap.get(cat, cat)
-            items = ae_fallback_search(query, limit=8, ship_to="IL")
-            if not items:
-                bot.send_message(c.message.chat.id, "ℹ️ לא נמצאו פריטים כרגע, נסה שוב.")
-            else:
-                append_to_pending(items)
-                bot.send_message(c.message.chat.id, f"✅ נוספו {len(items)} מוצרים. בתור: {pending_count()}")
-            return
+            if not item: return bot.answer_callback_query(c.id,"אין פריטים בתור", show_alert=True)
+            send_item(item, TARGET_CHAT_ID or c.message.chat.id)
+            bot.answer_callback_query(c.id,"✅ פורסם"); return
+        if data.startswith("ae:"):
+            if is_locked(): return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
+            cid = data.split(":",1)[1]
+            query = next((q for k,_,q in CATS if k==cid), cid)
+            items = discover(query, limit=12)
+            # Convert all to affiliate; enforce REQUIRE_AFFILIATE
+            affed = []
+            for it in items:
+                url_aff, ok = to_affiliate(it["url"])
+                it["url"] = url_aff
+                it["aff_ok"] = ok
+                if ok or not REQUIRE_AFFILIATE:
+                    affed.append(it)
+            if not affed:
+                bot.answer_callback_query(c.id, "לא נמצאו פריטים אפילייט, נסה שוב", show_alert=True); return
+            append_rows(affed)
+            bot.answer_callback_query(c.id, f"נוספו {len(affed)} (אפילייט)", show_alert=False)
+            bot.send_message(c.message.chat.id, f"✅ נוספו {len(affed)} פריטים אפילייט. בתור: {pending_count()}")
     except Exception as e:
-        try:
-            bot.answer_callback_query(c.id, f"שגיאה: {e}", show_alert=False)
-        except Exception:
-            pass
+        try: bot.answer_callback_query(c.id, f"שגיאה: {e}")
+        except Exception: pass
 
-# ======= Webhook =======
+# ======= Webhook endpoints =======
 @app.route("/webhook/<secret>", methods=["POST"])
 def webhook(secret):
-    if secret != WEBHOOK_SECRET:
-        return "forbidden", 403
-    if request.headers.get("content-type")=="application/json":
-        upd = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
-        bot.process_new_updates([upd])
-        return "OK", 200
-    return "unsupported", 415
-
-@app.route("/", methods=["GET"])
-def root():
+    if secret != WEBHOOK_SECRET: return "forbidden", 403
+    upd = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+    bot.process_new_updates([upd])
     return "OK", 200
 
+@app.route("/", methods=["GET"])
+def root(): return "OK", 200
+
 def setup_webhook():
-    if not BOT_TOKEN: 
-        print("[WH][ERR] No token", flush=True); return
-    # delete webhook first
+    if not USE_WEBHOOK: 
+        print("[WH] USE_WEBHOOK=0 -> webhook disabled"); return
     try:
         print("getWebhookInfo:", bot.get_webhook_info())
         bot.delete_webhook()
-        print("deleteWebhook:", True)
     except Exception as e:
-        print(f"[WH][WARN] deleteWebhook: {e}", flush=True)
-    url = compute_webhook_url()
-    if not url:
-        print("[WH][WARN] No base URL (set TELEGRAM_WEBHOOK_URL or TELEGRAM_WEBHOOK_BASE/RAILWAY_STATIC_URL)", flush=True)
+        print(f"[WH] delete_webhook: {e}")
+    if not TELEGRAM_WEBHOOK_BASE:
+        print("[WH][WARN] TELEGRAM_WEBHOOK_BASE missing")
         return
+    url = f"{TELEGRAM_WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
     try:
-        bot.set_webhook(url=url, allowed_updates=["message","callback_query"])
+        bot.set_webhook(url, allowed_updates=["message","callback_query"])
         print("setWebhook:", url)
     except Exception as e:
-        print(f"[WH][ERR] set_webhook: {e}", flush=True)
+        print(f"[WH][ERR] set_webhook: {e}")
 
 def run_server():
-    port = int(os.getenv("PORT", "8080"))
-    host = "0.0.0.0"
-    app.run(host=host, port=port, debug=False, threaded=True)
+    from waitress import serve
+    port = int(os.getenv("PORT","8080"))
+    print(f"[BOOT] Serving on 0.0.0.0:{port}")
+    serve(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # default ON unless BOT_START_LOCKED=1
-    if os.getenv("BOT_START_LOCKED","0")!="1":
+    if os.getenv("CLEAR_BOT_LOCK_ON_START","1") == "1":
+        if LOCK_PATH.exists():
+            LOCK_PATH.unlink()
+        print("[BOOT] Cleared bot lock")
+    if os.getenv("BOT_ALWAYS_ON","1") == "1":
         set_locked(False)
-        print("[BOOT] Cleared bot lock", flush=True)
     setup_webhook()
     run_server()
