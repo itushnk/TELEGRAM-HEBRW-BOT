@@ -1,4 +1,4 @@
-# autopatch.py - Railway hotfix autopatcher (v7-fix2)
+# autopatch.py - Railway hotfix autopatcher (v7-fix3)
 # -*- coding: utf-8 -*-
 import os, re, sys
 
@@ -14,40 +14,41 @@ except FileNotFoundError:
 
 changed = False
 
-# ---- 1) Fix unterminated f-string inside /status handler, if exists ----
-status_fn = re.search(r"(\n@bot\.message_handler\(commands=\['status'\]\)\s*\ndef\s+_autopatch_status\(m\)\s*:\s*\n)([\s\S]{1,1200}?)(?=\n@bot\.message_handler|\n#|\n\Z)", src)
-if status_fn:
-    head, body = status_fn.group(1), status_fn.group(2)
-    if ('msg = f"' in body and "\n" in body) or ('📥 פריטים ממתינים:' in body and '⏱️ השהייה בין פוסטים:' in body):
-        safe_msg = (
-            "    msg = (f\"📡 סטטוס בוט: פעיל\\n\"\n"
-            "           f\"📥 פריטים ממתינים: {q}\\n\"\n"
-            "           f\"⏱️ השהייה בין פוסטים: {POST_DELAY_SECONDS}s\")\n"
-        )
-        body2 = re.sub(r"\s*msg\s*=\s*f\s*\"[\s\S]*?\n\s*bot\.reply_to\(m,\s*msg\)", safe_msg + "    bot.reply_to(m, msg)", body, flags=re.S)
-        if body2 == body:
-            body2 = re.sub(r"\s*msg\s*=\s*f\s*\"[\s\S]*?\n", safe_msg, body, flags=re.S)
-        if body2 != body:
-            src = src.replace(head + body, head + body2)
+# --- Heuristic fix: convert literal backslash-n sequences into real newlines inside function bodies ---
+pat_fn = re.compile(r"(^def\s+\w+\s*\([^)]*\)\s*:\s*\n)", re.M)
+
+pieces = []
+last = 0
+for m in pat_fn.finditer(src):
+    fn_header = m.group(1)
+    start = m.end()
+    m2 = pat_fn.search(src, start)
+    end = m2.start() if m2 else len(src)
+
+    head = src[last:m.start()]
+    body = src[start:end]
+
+    # Only patch if suspicious "\n" sequences exist alongside indentation keywords
+    suspicious = re.search(r"\\n\s+(return|except|finally|elif|else|with|for|if|try|bot\.|print\(|raise|pass)", body)
+    if suspicious:
+        body_fixed = re.sub(r"\\n(\s+)", r"\n\1", body)
+        if body_fixed != body:
+            body = body_fixed
             changed = True
-            print("[AUTOPATCH] Rewrote /status msg into safe multi-line f-string", flush=True)
-else:
-    print("[AUTOPATCH] /status handler not found (nothing to fix)", flush=True)
+            print("[AUTOPATCH] Normalized literal \\n to newline inside a function block", flush=True)
 
-# ---- 2) Escape stray newlines inside other f-strings (best-effort) ----
-def fix_multiline_fstrings(s):
-    def repl(m):
-        inner = m.group(1).replace("\n", "\\n")
-        return 'f"' + inner + '"'
-    return re.sub(r'f\"([^\"]*\n[\s\S]*?)\"', repl, s)
+    pieces.append(head + fn_header + body)
+    last = end
+pieces.append(src[last:])
+src = "".join(pieces)
 
+# Also fix top-level occurrences like `)\n            return` that might appear outside any def (rare)
 before = src
-src = fix_multiline_fstrings(src)
+src = re.sub(r"\)\s*\\n(\s+)(return|raise|pass)", r")\n\1\2", src)
 if src != before:
     changed = True
-    print("[AUTOPATCH] Escaped stray newlines inside f-strings", flush=True)
+    print("[AUTOPATCH] Normalized top-level literal \\n patterns", flush=True)
 
-# ---- 3) Write back ----
 if changed:
     with open(PATH, "w", encoding="utf-8") as f:
         f.write(src)
