@@ -252,6 +252,42 @@ def cmd_post(m):
     send_item(item, target)
     bot.reply_to(m, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
 
+# ---- NEW: admin utilities ----
+@bot.message_handler(commands=["dump_pending"])
+def cmd_dump_pending(m):
+    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
+        bot.reply_to(m, "⛔ אין הרשאה לפקודה זו.")
+        return
+    ensure_pending_csv()
+    try:
+        if not PENDING_CSV.exists() or pending_count() == 0:
+            bot.reply_to(m, "אין פריטים בתור.")
+            return
+        with PENDING_CSV.open("rb") as f:
+            bot.send_document(m.chat.id, f, visible_file_name="pending.csv", caption=f"📥 תור נוכחי: {pending_count()} פריטים")
+    except Exception as e:
+        bot.reply_to(m, f"שגיאה בשליחה: {e}")
+
+@bot.message_handler(commands=["clear_pending"])
+def cmd_clear_pending(m):
+    if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
+        bot.reply_to(m, "⛔ אין הרשאה לפקודה זו.")
+        return
+    if not PENDING_CSV.exists():
+        bot.reply_to(m, "לא קיים תור למחיקה.")
+        return
+    # Count current
+    count_before = pending_count()
+    ensure_pending_csv()  # make sure header exists
+    try:
+        # rewrite header only
+        with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["item_id","title","url","price","image_url","ts"])
+        bot.reply_to(m, f"🧹 נמחקו {count_before} פריטים מהתור.")
+    except Exception as e:
+        bot.reply_to(m, f"שגיאה במחיקה: {e}")
+
 # ======= Callbacks =======
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c):
