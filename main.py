@@ -1,311 +1,495 @@
 # -*- coding: utf-8 -*-
 """
-AliExpress affiliate Telegram bot (v8):
-• Discovery by many categories/sub-niches
-• Filters: ship_to_country=IL, orders>=1000, sort by highest orders
-• Coupon injection when available
-• Post builder to your template (as per the sample you sent)
-Requires:
-  - python-aliexpress-api (wrapper)
-  - pyTelegramBotAPI + Flask or Polling (webhook optional)
-Environment:
-  TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL (e.g. -1001234567890 or @yourchannel)
-  AE_KEY, AE_SECRET, AE_TRACKING_ID
-  TARGET_CURRENCY=ILS (default), TARGET_LANGUAGE=HE (default)
-  IL_MIN_ORDERS=1000 (default)
+Telegram webhook bot with AliExpress affiliate-enforced links.
+v7e: discovery fix — remove /af endpoints (404), add mobile search URLs,
+     add he/aliexpress.us domains, and richer parsers (data-href, productId).
 """
-import os, time, json, math, random, threading
+import os, time, csv, random, re, threading
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from flask import Flask, request
+from urllib.parse import quote_plus
+import requests
 import telebot
 from telebot import types
+from flask import Flask, request
 
-# ===== Env =====
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN","")
-CHANNEL = os.getenv("TELEGRAM_CHANNEL","")  # @name or chat id
-AE_KEY = os.getenv("AE_KEY","")
-AE_SECRET = os.getenv("AE_SECRET","")
-AE_TRACKING_ID = os.getenv("AE_TRACKING_ID","")
-TARGET_CCY = os.getenv("TARGET_CURRENCY","ILS")
-TARGET_LANG = os.getenv("TARGET_LANGUAGE","HE")
-IL_MIN_ORDERS = int(os.getenv("IL_MIN_ORDERS","1000"))
-CHANNEL_JOIN_URL = os.getenv("CHANNEL_JOIN_URL", "https://t.me/+LlMY8B9soOdhNmZk")
-
+# ======= ENV / CONFIG =======
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+TELEGRAM_WEBHOOK_BASE = (os.getenv("TELEGRAM_WEBHOOK_BASE") or "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET") or "secret"
 USE_WEBHOOK = os.getenv("USE_WEBHOOK","1") == "1"
-PORT = int(os.getenv("PORT","8080"))
-HOST = os.getenv("HOST","0.0.0.0")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE_URL","")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET","/webhook/secret")
+PUBLIC_CHANNEL = os.getenv("PUBLIC_CHANNEL", "").strip()  # e.g. -100...
+TARGET_CHAT_ID = int(PUBLIC_CHANNEL) if PUBLIC_CHANNEL.lstrip("-").isdigit() else None
+CURRENCY = os.getenv("AE_TARGET_CURRENCY", "₪")
+SHIP_TO = os.getenv("AE_SHIP_TO_COUNTRY", "IL")
+LANG = (os.getenv("AE_TARGET_LANGUAGE", "EN") or "EN").upper()
+REQUIRE_AFFILIATE = os.getenv("REQUIRE_AFFILIATE","1") == "1"
 
-BASE_DIR = Path(os.getenv("BOT_DATA_DIR","./data"))
-BASE_DIR.mkdir(parents=True, exist_ok=True)
-CATEGORIES_PATH = Path(os.getenv("CATEGORIES_PATH", "categories.json"))
+# Affiliate API creds
+AE_APP_KEY = os.getenv("AE_API_APP_KEY", "").strip()
+AE_APP_SECRET = os.getenv("AE_APP_SECRET", "").strip()
+AE_TRACKING_ID = os.getenv("AE_TRACKING_ID", "").strip()
+AE_AFF_SHORT_KEY = os.getenv("AE_AFF_SHORT_KEY","").strip()  # optional fallback
 
-# ===== Telegram =====
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML") if BOT_TOKEN else None
+# Timing
+POST_DELAY_SECONDS = int(os.getenv("POST_DELAY_SECONDS","12") or "12")
+
+# Storage
+DATA_DIR = Path(os.getenv("DATA_DIR","data"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+PENDING_CSV = DATA_DIR / "pending.csv"
+LOCK_PATH = DATA_DIR / "bot.lock"
+
+# ======= Bot / Web =======
+if not BOT_TOKEN:
+    print("[BOOT][ERR] Missing bot token", flush=True)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-# ===== AliExpress wrapper =====
-aliexpress = None
-try:
-    from aliexpress_api import AliexpressApi, models
-    aliexpress = AliexpressApi(AE_KEY, AE_SECRET, getattr(models.Language, TARGET_LANG, models.Language.EN),
-                               getattr(models.Currency, TARGET_CCY, models.Currency.USD),
-                               AE_TRACKING_ID)
-except Exception as e:
-    print(f"[AE] Wrapper init failed: {e}")
+# ======= Helpers (lock & queue) =======
+def is_locked() -> bool:
+    return LOCK_PATH.exists()
 
-# ===== Helpers =====
-def fmt_price(v: str|float|int) -> str:
+def set_locked(val: bool) -> None:
     try:
-        x = float(str(v).replace(',',''))
-        return f"{x:.2f} ש\"ח"
-    except Exception:
-        return f"{v} ש\"ח"
+        if val:
+            LOCK_PATH.write_text("off", encoding="utf-8")
+        else:
+            if LOCK_PATH.exists():
+                LOCK_PATH.unlink()
+    except Exception as e:
+        print(f"[WARN] set_locked: {e}", flush=True)
 
-def pct(a: float, b: float) -> Optional[int]:
+def ensure_pending_csv():
+    if not PENDING_CSV.exists():
+        with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["item_id","title","url","price","image_url","ts","aff_ok"])
+
+def pending_count():
+    if not PENDING_CSV.exists():
+        return 0
+    with PENDING_CSV.open("r", encoding="utf-8") as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+def append_rows(rows):
+    ensure_pending_csv()
+    with PENDING_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        for r in rows:
+            w.writerow([
+                r.get("id",""),
+                r.get("title",""),
+                r.get("url",""),
+                r.get("price",""),
+                r.get("image_url",""),
+                int(time.time()),
+                "1" if r.get("aff_ok") else "0"
+            ])
+
+def pop_next_pending():
+    if not PENDING_CSV.exists():
+        return None
+    with PENDING_CSV.open("r", newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if len(rows) <= 1:
+        return None
+    header, first, rest = rows[0], rows[1], rows[2:]
+    with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for r in rest:
+            w.writerow(r)
+    keys = ["item_id","title","url","price","image_url","ts","aff_ok"]
+    if len(first) < len(keys):
+        first = first + [""]*(len(keys)-len(first))
+    return dict(zip(keys, first))
+
+# ======= AliExpress: discovery (mobile + desktop + DDG) =======
+_UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+]
+def _sess():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept-Language":"en-US,en;q=0.9",
+        "Accept":"text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    return s
+
+def _fetch_html(url, s, timeout=(7,10)):
+    r = s.get(url, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    return r.text
+
+# Accept any xx.aliexpress.(com|us|...)/item/....html and also protocol-relative links
+_ITEM_RE = re.compile(r'(?:https?:)?//[a-z\-]*\.?aliexpress\.(?:com|us)/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', re.I)
+
+def _parse_item_links(html):
+    out, seen = [], set()
+    # Normal absolute or protocol-relative item URLs
+    for m in _ITEM_RE.finditer(html):
+        url, pid = m.group(0), m.group(1)
+        if url.startswith("//"):
+            url = "https:" + url
+        if url in seen: 
+            continue
+        seen.add(url)
+        out.append({"id": pid, "url": url})
+    # Mobile relative hrefs
+    for m in re.finditer(r'href=["\'](/item/(\d{8,})\.html)["\']', html):
+        pid = m.group(2); url = f"https://m.aliexpress.com/item/{pid}.html"
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
+    # data-href attributes commonly used in grid items
+    for m in re.finditer(r'data-href=["\'](//[^"\']*?/item/(\d{8,})\.html[^"\']*)["\']', html):
+        url, pid = m.group(1), m.group(2)
+        if url.startswith("//"): url = "https:" + url
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
+    # productId JSON — reconstruct URL
+    for m in re.finditer(r'["\']productId["\']\s*:\s*["\'](\d{8,})["\']', html):
+        pid = m.group(1); url = f"https://www.aliexpress.com/item/{pid}.html"
+        if url in seen: continue
+        seen.add(url); out.append({"id": pid, "url": url})
+    return out
+
+def _scrape_meta(url, s):
     try:
-        if b and b>0:
-            return int(round(100*(1 - a/b)))
-    except Exception:
+        h = _fetch_html(url, s, timeout=(5,8))
+        title = None
+        m = re.search(r'property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', h)
+        if m: title = m.group(1)
+        m = re.search(r'<title>\s*([^<]+)\s*</title>', h)
+        if (not title) and m: title = m.group(1)
+        img = None
+        m = re.search(r'property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h)
+        if m: img = m.group(1)
+        pid_match = re.search(r'(\d{8,})\.html', url); pid = pid_match.group(1) if pid_match else ""
+        return {"id": pid, "title": (title or "AliExpress product").strip(), "url": url, "image_url": img or "", "price": ""}
+    except Exception as e:
+        print(f"[META][WARN] {url} -> {e}", flush=True)
         return None
 
-def star_to_pct(star: Optional[float]) -> Optional[float]:
-    if star is None: return None
-    try:
-        return round(min(max(star,0),5)*20.0, 1)
-    except:
-        return None
-
-def choose_best_orders(item: Any) -> int:
-    # Prefer last 30-day volume if present; else total sales/orders field if provided by wrapper
-    for field in ("lastest_volume", "last_volume", "volume", "orders", "sale_count", "product_sale"):
-        v = getattr(item, field, None) if hasattr(item, field) else item.get(field) if isinstance(item, dict) else None
-        if v is None: continue
-        try:
-            return int(v)
-        except: 
-            try:
-                return int(float(str(v).replace(',','')))
-            except:
-                pass
-    return 0
-
-def extract_coupon(item: Any) -> Optional[str]:
-    # Many APIs expose coupon fields differently; try common ones
-    fields = []
-    if hasattr(item, "coupon_start_time") or hasattr(item,"coupon_amount"):
-        amt = getattr(item,"coupon_amount",None)
-        if amt:
-            fields.append(f"🎁 קופון לחברי הערוץ בלבד: {amt}")
-    for k in ("coupon","coupon_amount","coupon_value","coupon_info","coupon_link","coupon_start_time"):
-        v = getattr(item,k,None) if hasattr(item,k) else item.get(k) if isinstance(item,dict) else None
-        if v:
-            if isinstance(v,(int,float)): fields.append(f"🎁 קופון לחברי הערוץ בלבד: {v}")
-            elif isinstance(v,str): fields.append(f"🎁 קופון לחברי הערוץ בלבד: {v}")
-    if fields:
-        return fields[0]
-    return None
-
-def get_aff_link(product_url: str) -> str:
-    # Try official wrapper
-    if aliexpress:
-        try:
-            links = aliexpress.get_affiliate_links(product_url)
-            if links and getattr(links[0], "promotion_link", None):
-                return links[0].promotion_link
-        except Exception as e:
-            print(f"[AE] affiliate_links failed: {e}")
-    return product_url
-
-def build_post_he(item: Any, aff_url: str) -> str:
-    # Extract fields from wrapper object
-    title = getattr(item, "product_title", None) or getattr(item, "title", "מוצר")
-    sale = getattr(item, "target_sale_price", None) or getattr(item, "sale_price", None) or getattr(item, "app_sale_price", None)
-    orig = getattr(item, "target_original_price", None) or getattr(item, "original_price", None)
-    orders = choose_best_orders(item)
-    rating = None
-    for f in ("evaluate_rate", "product_average_rating", "avg_rating", "evaluate_score"):
-        v = getattr(item,f,None) if hasattr(item,f) else item.get(f) if isinstance(item,dict) else None
-        if v:
-            try:
-                rating = float(v)
-                break
-            except: pass
-    rating_pct = star_to_pct(rating) if rating is not None and rating<=5.0 else (float(rating) if rating else None)
-
-    # Shipping
-    shipping_line = "🚚 משלוח חינם/מחושב בקופה"
-    for k in ("freight_template_id","logistics_info","estimated_delivery_time"):
-        if hasattr(item,k) or (isinstance(item,dict) and k in item):
-            shipping_line = "🚚 משלוח זמין לישראל (עלות מחושבת בקופה)"
-            break
-
-    # Savings
-    saving_pct = pct(float(sale) if sale else 0.0, float(orig) if orig else 0.0)
-
-    # Template (based on your sample)
-    # CTA + Description are left simple; often you run a translator upstream
-    cta = f"🏗️ {title[:28]} — בשלט!"
-    desc = f"🚜 {title}"
-    strengths = [
-        "🧲 הנעה ‎4WD‎ לעבירות משופרת",
-        "🔦 תאורת ‎LED‎ לאקשן גם בערב",
-        "🎮 שלט ‎2.4G‎ יציב, קל להפעלה",
+def discover(query, limit=12):
+    s = _sess()
+    q = quote_plus(query)
+    urls = [
+        f"https://m.aliexpress.com/search.htm?keywords={q}&g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/search?keywords={q}&g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/wholesale/{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://he.aliexpress.com/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.us/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/w/wholesale-{q}.html?g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
+    ] + [  # search engine HTML fallbacks
+        f"https://duckduckgo.com/html/?q={quote_plus('site:aliexpress.com/item ' + query)}&s={off}" for off in [0,30,60,90]
     ]
+    found = []
+    for u in urls:
+        try:
+            html = _fetch_html(u, s)
+            links = _parse_item_links(html)
+            found += links
+            if links:
+                print(f"[DISCOVER][HIT] {u} -> {len(links)} links", flush=True)
+            else:
+                print(f"[DISCOVER][MISS] {u}", flush=True)
+            if len(found) >= limit*2:
+                break
+        except Exception as e:
+            print(f"[DISCOVER][WARN] {u} -> {e}", flush=True)
+    uniq, seen = [], set()
+    for it in found:
+        if it["url"] in seen: continue
+        seen.add(it["url"]); uniq.append(it["url"])
+        if len(uniq) >= limit: break
+    items = []
+    for u in uniq:
+        m = _scrape_meta(u, s)
+        if m: items.append(m)
+    print(f"[DISCOVER] '{query}' -> {len(items)} items", flush=True)
+    return items
 
-    lines = []
-    lines.append(cta)
-    lines.append("")
-    lines.append(desc)
-    lines.append("")
-    lines.extend(strengths)
-    if sale:
-        lines.append(f"💰 מחיר מבצע: {fmt_price(sale)} ({aff_url})" + (f" (מחיר מקורי: {fmt_price(orig)})" if orig else ""))
-    if saving_pct is not None:
-        lines.append(f"💸 חיסכון של {saving_pct}%!")
-    if rating_pct is not None:
-        lines.append(f"⭐️ דירוג: {rating_pct}%")
-    if orders:
-        lines.append(f"📦 {orders} הזמנות")
-    lines.append(shipping_line)
-    lines.append(f"להזמנה מהירה👈 לחצו כאן ({aff_url})")
-    product_id = getattr(item, "product_id", None) or getattr(item, "item_id", None) or getattr(item, "app_sale_price_id", None) or "—"
-    lines.append(f"מספר פריט: {product_id}")
-    lines.append(f"להצטרפות לערוץ לחצו כאן👈 קליק והצטרפתם ({CHANNEL_JOIN_URL})")
-    lines.append("👇🛍הזמינו עכשיו🛍👇")
-    lines.append(f"לחיצה וזה בדרך ({aff_url})")
-
-    # Coupon (optional line near the end)
-    coup = extract_coupon(item)
-    if coup: lines.insert(-2, coup)
-
-    return "\n".join(lines)
-
-def search_keyword(keyword: str, size:int=50, page:int=1) -> List[Any]:
-    """Use official wrapper. Sort by highest recent orders; ship to IL; then filter orders>=1000"""
-    results: List[Any] = []
-    if not aliexpress:
-        print("[AE] Not initialized; cannot query API")
-        return results
+# ======= Affiliate wrapping =======
+def _aliexpress_api_client():
+    if not (AE_APP_KEY and AE_APP_SECRET and AE_TRACKING_ID):
+        return None
     try:
-        # Many wrappers accept sort keys like LAST_VOLUME_DESC (highest recent orders)
-        response = aliexpress.get_products(
-            keywords=keyword,
-            sort='LAST_VOLUME_DESC',
-            ship_to_country='IL',
-            page_no=page,
-            page_size=size
-        )
-        products = getattr(response, "products", [])
-        for p in products:
-            if choose_best_orders(p) >= IL_MIN_ORDERS:
-                results.append(p)
+        from aliexpress_api import AliexpressApi, models
+        lang_map = {k:getattr(models.Language,k) for k in dir(models.Language) if k.isupper()}
+        cur_map  = {k:getattr(models.Currency,k) for k in dir(models.Currency) if k.isupper()}
+        lang = lang_map.get(LANG, models.Language.EN)
+        cur  = cur_map.get(CURRENCY.upper(), models.Currency.USD)
+        api = AliexpressApi(AE_APP_KEY, AE_APP_SECRET, lang, cur, AE_TRACKING_ID, session=None)
+        def make(url: str):
+            try:
+                links = api.get_affiliate_links(url)
+                if links and getattr(links[0], "promotion_link", None):
+                    return links[0].promotion_link
+            except Exception as e:
+                print(f"[AEAPI][ERR] {e}", flush=True)
+            return None
+        print("[AEAPI] Ready", flush=True)
+        return make
     except Exception as e:
-        print(f"[AE] get_products failed: {e}")
-    return results
+        print(f"[AEAPI][WARN] {e}", flush=True)
+        return None
 
-def discover_from_categories(max_per_sub:int=10) -> List[Any]:
-    """Iterate categories.json → collect candidates"""
+def _s_click_fallback(url: str):
+    if not AE_AFF_SHORT_KEY:
+        return None
+    base = "https://s.click.aliexpress.com/deep_link.htm"
+    target = url
+    if "?" in target:
+        target += f"&shipCountry={quote_plus(SHIP_TO)}"
+    else:
+        target += f"?shipCountry={quote_plus(SHIP_TO)}"
+    return f"{base}?aff_short_key={quote_plus(AE_AFF_SHORT_KEY)}&dl_target_url={quote_plus(target)}"
+
+AFF_MAKER = _aliexpress_api_client()
+
+def to_affiliate(url: str):
+    u = (url or "").strip()
+    if not u:
+        return u, False
+    if AFF_MAKER:
+        link = AFF_MAKER(u)
+        if link:
+            print(f"[AFF] API OK -> {link[:80]}...", flush=True)
+            return link, True
+        else:
+            print("[AFF] API FAIL", flush=True)
+    link = _s_click_fallback(u)
+    if link:
+        print(f"[AFF] s.click OK -> {link[:80]}...", flush=True)
+        return link, True
+    print("[AFF] NO-AFF", flush=True)
+    return u, False
+
+# ======= UI =======
+CATS = [
+    ("gadgets","📱 גאדג'טים",["gadgets electronic gadget", "smart gadget", "electronics accessories", "usb gadget"]),
+    ("fashion_men","👔 אופנת גברים",["men compression shorts running gym", "training tights men", "sportswear men"]),
+    ("fashion_women","👗 אופנת נשים",["women leggings yoga gym", "women sport leggings", "yoga pants women"]),
+    ("home_tools","🧰 כלי בית",["home tools hardware screwdriver drill set", "household tools set", "drill screwdriver set"]),
+    ("fitness","🏃 ספורט וכושר",["fitness gear resistance band", "gym accessories", "sports equipment"]),
+    ("beauty","💄 ביוטי",["beauty makeup cosmetic", "makeup brush set", "lipstick set"]),
+]
+
+def build_menu():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("🛒 שאיבה לפי קטגוריות", callback_data="cats"))
+    kb.add(types.InlineKeyboardButton("🚀 פרסם עכשיו", callback_data="post_now"),
+           types.InlineKeyboardButton("📥 מצב תור", callback_data="queue"))
+    kb.add(types.InlineKeyboardButton("🔌 הפעלה", callback_data="on"),
+           types.InlineKeyboardButton("🛑 כיבוי", callback_data="off"))
+    return kb
+
+def build_cats():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for cid, label, _ in CATS:
+        kb.add(types.InlineKeyboardButton(label, callback_data=f"ae:{cid}"))
+    kb.add(types.InlineKeyboardButton("⬅️ חזרה", callback_data="back"))
+    return kb
+
+def format_post(item):
+    title = (item.get("title") or "").strip()
+    price = (item.get("price") or "").strip()
+    parts = [f"🛍️ {title}", "👉 לחץ להזמנה בקישור מטה"]
+    if price:
+        parts.insert(1, f"💰 מחיר: {price} {CURRENCY}".strip())
+    return "\n\n".join(parts)
+
+def send_item(item, chat_id):
+    text = format_post(item)
+    url = (item.get("url") or "").strip()
+    img = (item.get("image_url") or "").strip()
+    btn_txt = "🛒 לקנייה עכשיו" + (" ✅ אפילייט" if item.get("aff_ok") in ("1",1,True) else "")
+    kb = types.InlineKeyboardMarkup()
+    if url:
+        kb.add(types.InlineKeyboardButton(btn_txt, url=url))
     try:
-        cfg = json.loads(Path(CATEGORIES_PATH).read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[CFG] categories.json read error: {e}")
-        return []
-    bag = []
-    for cat in cfg:
-        for sub in cat.get("sub", []):
-            for kw in sub.get("keywords", []):
-                found = search_keyword(kw, size=50, page=1)
-                # already sorted by orders desc; keep up to max_per_sub
-                bag.extend(found[:max_per_sub])
-                time.sleep(0.4 + random.random()*0.3)
-    # Dedupe by product_id
-    seen = set()
-    uniq = []
-    for p in bag:
-        pid = getattr(p,"product_id",None) or getattr(p,"item_id",None) or getattr(p,"app_sale_price_id",None)
-        if pid and pid in seen: continue
-        if pid: seen.add(pid)
-        uniq.append(p)
-    # Sort final by orders desc again
-    uniq.sort(key=lambda x: choose_best_orders(x), reverse=True)
-    return uniq
+        if img:
+            bot.send_photo(chat_id, img, caption=text, reply_markup=kb)
+        else:
+            bot.send_message(chat_id, text, reply_markup=kb)
+    except Exception:
+        bot.send_message(chat_id, text + "\n\n(תמונה לא נשלחה)", reply_markup=kb)
 
-def post_to_channel(text: str):
-    if not bot or not CHANNEL:
-        print("[TG] Missing bot token or channel id")
-        return
-    try:
-        bot.send_message(CHANNEL, text)
-    except Exception as e:
-        print(f"[TG] send_message failed: {e}")
-
-# ===== Routes / Commands =====
-@app.route("/", methods=["GET"])
-def root():
-    return "OK v8", 200
-
-@app.route(WEBHOOK_SECRET, methods=["POST"])
-def webhook():
-    if not bot:
-        return "No bot", 500
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "ok", 200
-
-@bot.message_handler(commands=["start","help"])
+# ======= Commands =======
+@bot.message_handler(commands=["start","menu"])
 def cmd_start(m):
-    bot.reply_to(m, "היי! /discover כדי לאתר מוצרים חדשים (1000+ הזמנות, משלוח לישראל) ואז /post כדי לפרסם.")
+    bot.reply_to(m, f"שלום! מצב: {'כבוי' if is_locked() else 'פעיל'}", reply_markup=build_menu())
 
-@bot.message_handler(commands=["discover"])
-def cmd_discover(m):
-    bot.reply_to(m, "מאתר נישות ומוצרים...")
-    items = discover_from_categories(max_per_sub=10)
-    Path(BASE_DIR/"last_discover.json").write_text(json.dumps([p.__dict__ for p in items], ensure_ascii=False, indent=2), encoding="utf-8")
-    bot.reply_to(m, f"נמצאו {len(items)} מוצרים מתאימים עם 1000+ הזמנות ושילוח לישראל. /post כדי לפרסם דוגמה.")
+@bot.message_handler(commands=["on"])
+def cmd_on(m):
+    set_locked(False)
+    bot.reply_to(m, "🔌 הופעל", reply_markup=build_menu())
+
+@bot.message_handler(commands=["off"])
+def cmd_off(m):
+    set_locked(True)
+    bot.reply_to(m, "🛑 כובה", reply_markup=build_menu())
+
+@bot.message_handler(commands=["status"])
+def cmd_status(m):
+    bot.reply_to(m, f"📥 בתור: {pending_count()} | מצב: {'כבוי' if is_locked() else 'פעיל'}")
 
 @bot.message_handler(commands=["post"])
 def cmd_post(m):
+    if is_locked():
+        return bot.reply_to(m,"הבוט כבוי.")
+    item = pop_next_pending()
+    if not item:
+        return bot.reply_to(m, "אין פריטים בתור.")
+    target = TARGET_CHAT_ID or m.chat.id
+    send_item(item, target)
+    bot.reply_to(m, f"✅ פורסם. נותרו: {pending_count()}")
+
+@bot.message_handler(commands=["aff_test"])
+def cmd_aff_test(m):
+    parts = (m.text or "").split(None,1)
+    if len(parts) < 2:
+        return bot.reply_to(m,"שימוש: /aff_test <url>")
+    u = parts[1].strip()
+    aff, ok = to_affiliate(u)
+    bot.reply_to(m, f"{'✅' if ok else '⚠️ NO-AFF'}\n{aff}")
+
+# ======= Callbacks =======
+def _discover_many(queries, limit_each=6):
+    res = []
+    for q in queries:
+        items = discover(q, limit=limit_each)
+        res += items
+        if len(res) >= 12:
+            break
+    return res[:12]
+
+@bot.callback_query_handler(func=lambda c: True)
+def on_cb(c):
     try:
-        raw = json.loads((BASE_DIR/"last_discover.json").read_text(encoding="utf-8"))
-    except Exception:
-        bot.reply_to(m,"אין תוצאות אחרונות. הרץ /discover קודם.")
-        return
-    if not raw:
-        bot.reply_to(m,"אין פריטים מתאימים כרגע.")
-        return
-    # Pick best by orders
-    raw.sort(key=lambda x: choose_best_orders(x), reverse=True)
-    top = raw[0]
-    class Obj: pass
-    obj = Obj(); obj.__dict__.update(top)
-    url = getattr(obj,"product_url",None) or getattr(obj,"product_detail_url",None) or getattr(obj,"product_main_url", None) or f"https://aliexpress.com/item/{getattr(obj,'product_id','')}"
-    aff = get_aff_link(url)
-    text = build_post_he(obj, aff)
-    post_to_channel(text)
-    bot.reply_to(m, "נשלח לערוץ ✅")
+        data = c.data or ""
+        if data == "cats":
+            bot.answer_callback_query(c.id)
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_cats())
+            return
+        if data == "back":
+            bot.answer_callback_query(c.id)
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=build_menu())
+            return
+        if data == "queue":
+            bot.answer_callback_query(c.id, f"בתור: {pending_count()}")
+            return
+        if data == "on":
+            set_locked(False)
+            bot.answer_callback_query(c.id,"🔌 הופעל")
+            return
+        if data == "off":
+            set_locked(True)
+            bot.answer_callback_query(c.id,"🛑 כובה")
+            return
+        if data == "post_now":
+            if is_locked():
+                return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
+            item = pop_next_pending()
+            if not item:
+                return bot.answer_callback_query(c.id,"אין פריטים בתור", show_alert=True)
+            send_item(item, TARGET_CHAT_ID or c.message.chat.id)
+            bot.answer_callback_query(c.id,"✅ פורסם")
+            return
+        if data.startswith("ae:"):
+            if is_locked():
+                return bot.answer_callback_query(c.id,"כבוי.", show_alert=True)
+            cid = data.split(":",1)[1]
+            queries = next((qs for k,_,qs in CATS if k==cid), [cid])
+            try:
+                bot.answer_callback_query(c.id, "⏳ שואב פריטים…")
+            except Exception:
+                pass
+            def work():
+                try:
+                    items = _discover_many(queries, limit_each=6)
+                    affed = []
+                    for it in items:
+                        url_aff, ok = to_affiliate(it["url"])
+                        it["url"] = url_aff
+                        it["aff_ok"] = ok
+                        if ok or not REQUIRE_AFFILIATE:
+                            affed.append(it)
+                    if not affed:
+                        bot.send_message(c.message.chat.id, "ℹ️ לא נמצאו פריטים אפילייט כרגע, נסה שוב.")
+                        return
+                    append_rows(affed)
+                    bot.send_message(c.message.chat.id, f"✅ נוספו {len(affed)} פריטים אפילייט. בתור: {pending_count()}")
+                except Exception as e:
+                    bot.send_message(c.message.chat.id, f"שגיאה בשאיבה: {e}")
+            threading.Thread(target=work, daemon=True).start()
+            return
+    except Exception as e:
+        try:
+            bot.answer_callback_query(c.id, f"שגיאה: {e}")
+        except Exception:
+            pass
+
+# ======= Webhook endpoints =======
+@app.route("/webhook/<secret>", methods=["POST"])
+def webhook(secret):
+    if secret != WEBHOOK_SECRET:
+        return "forbidden", 403
+    payload = request.get_data(as_text=True) or ""
+    def worker(data_text: str):
+        try:
+            upd = telebot.types.Update.de_json(data_text)
+            bot.process_new_updates([upd])
+        except Exception as e:
+            print(f"[WH][ERR] {e}", flush=True)
+    threading.Thread(target=worker, args=(payload,), daemon=True).start()
+    return "OK", 200
+
+@app.route("/_health", methods=["GET"])
+def health():
+    return "OK", 200
+
+@app.route("/", methods=["GET"])
+def root():
+    return "OK", 200
 
 def setup_webhook():
-    if not bot: 
-        print("[BOOT] Bot token missing")
+    if not USE_WEBHOOK:
+        print("[WH] USE_WEBHOOK=0 -> webhook disabled")
         return
-    if USE_WEBHOOK and WEBHOOK_BASE:
-        wh = WEBHOOK_BASE.rstrip("/") + WEBHOOK_SECRET
-        try:
-            bot.remove_webhook()
-        except Exception: pass
-        ok = bot.set_webhook(url=wh, allowed_updates=["message","callback_query"])
-        print("setWebhook:", wh, ok)
-    else:
-        print("Webhook disabled; polling not implemented in this minimal build.")
+    try:
+        info = bot.get_webhook_info()
+        print("getWebhookInfo:", info)
+        bot.delete_webhook()
+    except Exception as e:
+        print(f"[WH] delete_webhook: {e}")
+    if not TELEGRAM_WEBHOOK_BASE:
+        print("[WH][WARN] TELEGRAM_WEBHOOK_BASE missing")
+        return
+    url = f"{TELEGRAM_WEBHOOK_BASE}/webhook/{WEBHOOK_SECRET}"
+    try:
+        bot.set_webhook(url, allowed_updates=["message","callback_query"])
+        print("setWebhook:", url)
+    except Exception as e:
+        print(f"[WH] set_webhook: {e}")
 
-def serve():
-    from waitress import serve as wserve
-    print(f"[BOOT] Serving on {HOST}:{PORT}")
-    wserve(app, host=HOST, port=PORT)
+def run_server():
+    from waitress import serve
+    port = int(os.getenv("PORT","8080"))
+    print(f"[BOOT] Serving on 0.0.0.0:{port}")
+    serve(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
+    if os.getenv("CLEAR_BOT_LOCK_ON_START","1") == "1":
+        if LOCK_PATH.exists():
+            LOCK_PATH.unlink()
+        print("[BOOT] Cleared bot lock")
+    if os.getenv("BOT_ALWAYS_ON","1") == "1":
+        set_locked(False)
     setup_webhook()
-    serve()
+    run_server()
