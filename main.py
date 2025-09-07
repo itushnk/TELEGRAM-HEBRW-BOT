@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, time, json, csv, re
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 import requests
 import telebot
 from telebot import types
@@ -103,60 +103,77 @@ def pop_next_pending():
     item = dict(zip(keys, item_row + [""]*(len(keys)-len(item_row))))
     return item
 
-# Simple, resilient AE fallback via HTML
+# ================= AliExpress Fallback (robust) ==================
+def _fetch_html(url, sess, timeout=(10,20)):
+    r = sess.get(url, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+    if "Maintaining" in r.text[:200] or "<title>AliExpress.com - Maintaining" in r.text:
+        # Sometimes maintenance page by locale => try again with english params
+        raise RuntimeError("maintenance page")
+    return r.text
+
+def _parse_links(html):
+    items = []
+    # 1) Pure /item/<id>.html links, any place in HTML
+    for m in re.finditer(r'https?://(?:www|m)\.aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', html):
+        url = m.group(0)
+        pid = m.group(1)
+        s = m.start()
+        # Try to get nearby title via alt="" or title="" within +/- 500 chars
+        window = html[max(0, s-600): s+600]
+        t = None
+        m1 = re.search(r'alt="([^"]{8,200})"', window)
+        if not t and m1: t = m1.group(1)
+        m2 = re.search(r'title="([^"]{8,200})"', window)
+        if not t and m2: t = m2.group(1)
+        # fallback: link text
+        m3 = re.search(r'>\s*([^<>]{10,200})\s*<', window)
+        if not t and m3: t = m3.group(1).strip()
+        # image
+        img = None
+        mimg = re.search(r'(https://ae\d+\.alicdn\.com/[^"\']+\.(?:jpg|jpeg|png))', window, re.I)
+        if mimg: img = mimg.group(1)
+        items.append({"id": pid, "title": (t or "AliExpress product"), "url": url, "image_url": img or "", "price": ""})
+    # 2) Deduplicate by id while keeping order
+    out, seen = [], set()
+    for it in items:
+        if it["id"] in seen: continue
+        seen.add(it["id"]); out.append(it)
+    return out
+
 def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
     try:
-        params = {"SearchText": query, "ShipCountry": ship_to, "SortType": "total_tranpro_desc", "g": "y"}
-        url = "https://www.aliexpress.com/wholesale?" + urlencode(params, doseq=True)
+        q = quote_plus(query)
+        urls = [
+            f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc",
+            f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
+            f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc",
+        ]
         sess = requests.Session()
         sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",  # deliberately english for simpler DOM
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Connection": "keep-alive",
             "Referer": "https://www.aliexpress.com/"
         })
-        cookies = {"xman_us_f": "x_lan=he_IL&x_locale=he_IL&region=IL&b_locale=he_IL"}
-        r = sess.get(url, timeout=(10,20), cookies=cookies)
-        r.raise_for_status()
-        html = r.text
-        items = []
-        # Try embedded JSON blocks
-        for pat in [r"window\.__AER_DATA__\s*=\s*(\{.*?\});", r"window\.runParams\s*=\s*(\{.*?\});"]:
-            m = re.search(pat, html, re.S)
-            if m:
-                raw = m.group(1).strip().rstrip(";")
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    data = None
-                if data:
-                    def walk(o):
-                        if isinstance(o, dict):
-                            pid = o.get("productId") or o.get("itemId") or o.get("id")
-                            title = o.get("title") or o.get("productTitle")
-                            url = o.get("productDetailUrl") or o.get("productUrl") or o.get("url")
-                            img = o.get("productMainImageUrl") or o.get("imageUrl") or o.get("image")
-                            price = o.get("appSalePrice") or o.get("salePrice") or o.get("price")
-                            if pid and title and url:
-                                items.append({"id": str(pid), "title": str(title), "url": str(url), "image_url": img or "", "price": price or ""})
-                            for v in o.values():
-                                walk(v)
-                        elif isinstance(o, list):
-                            for it in o: walk(it)
-                    walk(data)
-        if not items:
-            # Anchor-based fallback
-            for m in re.finditer(r'href="(https://www\.aliexpress\.com/item/[^"]+)"[^>]*>([^<]{10,120})</a>', html):
-                url, title = m.group(1), m.group(2).strip()
-                items.append({"id": str(abs(hash(url))), "title": title, "url": url, "image_url": "", "price": ""})
-
-        # Unique & limit
-        out, seen = [], set()
-        for it in items:
-            pid = it.get("id")
-            if not pid or pid in seen: continue
-            seen.add(pid); out.append(it)
-            if len(out) >= limit: break
-        return out
+        total = []
+        for url in urls:
+            try:
+                html = _fetch_html(url, sess)
+                items = _parse_links(html)
+                if items:
+                    total.extend(items)
+            except Exception as e:
+                print(f"[AE][FALLBACK][WARN] {url} -> {e}", flush=True)
+        # Dedup & cut
+        uniq, seen = [], set()
+        for it in total:
+            if it["id"] in seen: continue
+            seen.add(it["id"]); uniq.append(it)
+            if len(uniq) >= limit: break
+        print(f"[AE][FALLBACK] query='{query}' -> {len(uniq)} items", flush=True)
+        return uniq
     except Exception as e:
         print(f"[AE][FALLBACK][ERR] {e}", flush=True)
         return []
@@ -252,7 +269,7 @@ def cmd_post(m):
     send_item(item, target)
     bot.reply_to(m, f"✅ פורסם ל־{target}. נותרו בתור: {pending_count()}")
 
-# ---- NEW: admin utilities ----
+# ---- Admin utilities ----
 @bot.message_handler(commands=["dump_pending"])
 def cmd_dump_pending(m):
     if ADMIN_ID and m.from_user and m.from_user.id != ADMIN_ID:
@@ -287,6 +304,21 @@ def cmd_clear_pending(m):
         bot.reply_to(m, f"🧹 נמחקו {count_before} פריטים מהתור.")
     except Exception as e:
         bot.reply_to(m, f"שגיאה במחיקה: {e}")
+
+# ---- NEW: test AE ----
+@bot.message_handler(commands=["test_ae"])
+def cmd_test_ae(m):
+    parts = (m.text or "").split(None, 1)
+    if len(parts) < 2:
+        bot.reply_to(m, "שימוש: /test_ae <שאילתא>, לדוגמה: /test_ae gadgets")
+        return
+    query = parts[1].strip()
+    items = ae_fallback_search(query, limit=10, ship_to="IL")
+    if not items:
+        bot.reply_to(m, f"לא נמצאו פריטים עבור: {query}")
+        return
+    preview = "\n".join([f"- {it['title'][:60]}…" for it in items[:5]])
+    bot.reply_to(m, f"נמצאו {len(items)} פריטים עבור: {query}\n{preview}")
 
 # ======= Callbacks =======
 @bot.callback_query_handler(func=lambda c: True)
