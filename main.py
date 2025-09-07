@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from flask import Flask, request
 import telebot
+import requests
 from telebot import types
 
 # ===== Env =====
@@ -702,6 +703,18 @@ def cmd_shipmax(m):
     bot.reply_to(m, f"מסנן עלות משלוח מקסימלית עודכן ל: {v if v is not None else 'ללא הגבלה'} ₪")
 
 
+
+def _delete_webhook_hard():
+    if not bot or not BOT_TOKEN:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=true"
+        r = requests.get(url, timeout=10)
+        print("[BOOT] deleteWebhook drop_pending_updates:", r.status_code, r.text[:120])
+    except Exception as e:
+        print("[BOOT] deleteWebhook failed:", e)
+
+
 def setup_webhook():
     if not bot:
         print("[BOOT] Bot token missing")
@@ -718,19 +731,34 @@ def setup_webhook():
     else:
         print("[BOOT] Webhook disabled/missing base — starting polling mode")
         def _poll():
+            # Hard delete webhook (drop pending) and then start polling with retry
             try:
-                # drop any webhook first just in case
                 try:
                     bot.remove_webhook()
                 except Exception:
                     pass
-                bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=["message","callback_query"])
-            except Exception as e:
-                print("[POLL] exited:", e)
+                _delete_webhook_hard()
+            except Exception:
+                pass
+            import time as _t
+            backoff = 5
+            while True:
+                try:
+                    bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=["message","callback_query"])
+                except Exception as e:
+                    print("[POLL] exited:", e)
+                    msg = str(e)
+                    if "Error code: 409" in msg or "terminated by other getUpdates" in msg:
+                        print("[POLL] 409 Conflict — יש כנראה אינסטנס נוסף של הבוט עם אותו טוקן שמריץ polling. ודא שיש רק שירות אחד פעיל, או עבור ל-Webhook.")
+                    _t.sleep(backoff)
+                    backoff = min(backoff*2, 120)
+                else:
+                    backoff = 5
+            
         import threading
         t = threading.Thread(target=_poll, daemon=True)
         t.start()
-        print("[POLL] Started background polling thread")
+        print("[POLL] Started background polling thread (robust)")
 
 def serve():
     from waitress import serve as wserve
