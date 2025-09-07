@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, time, json, csv, re
+import os, time, json, csv, re, random
 from pathlib import Path
 from urllib.parse import urlencode, quote_plus
 import requests
@@ -103,80 +103,119 @@ def pop_next_pending():
     item = dict(zip(keys, item_row + [""]*(len(keys)-len(item_row))))
     return item
 
-# ================= AliExpress Fallback (robust) ==================
+# ================= AliExpress Fallbacks ==================
+_UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+]
+
+def _sess():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": random.choice(_UA_LIST),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+        "Referer": "https://www.aliexpress.com/"
+    })
+    return s
+
 def _fetch_html(url, sess, timeout=(10,20)):
     r = sess.get(url, timeout=timeout, allow_redirects=True)
     r.raise_for_status()
-    if "Maintaining" in r.text[:200] or "<title>AliExpress.com - Maintaining" in r.text:
-        # Sometimes maintenance page by locale => try again with english params
+    if "AliExpress.com - Maintaining" in r.text[:200] or "center/maintain" in r.url:
         raise RuntimeError("maintenance page")
     return r.text
 
-def _parse_links(html):
+def _parse_item_links_from_html(html):
     items = []
-    # 1) Pure /item/<id>.html links, any place in HTML
     for m in re.finditer(r'https?://(?:www|m)\.aliexpress\.com/item/[^\s"<>]*?(\d{8,})\.html[^\s"<>]*', html):
         url = m.group(0)
         pid = m.group(1)
-        s = m.start()
-        # Try to get nearby title via alt="" or title="" within +/- 500 chars
-        window = html[max(0, s-600): s+600]
-        t = None
-        m1 = re.search(r'alt="([^"]{8,200})"', window)
-        if not t and m1: t = m1.group(1)
-        m2 = re.search(r'title="([^"]{8,200})"', window)
-        if not t and m2: t = m2.group(1)
-        # fallback: link text
-        m3 = re.search(r'>\s*([^<>]{10,200})\s*<', window)
-        if not t and m3: t = m3.group(1).strip()
-        # image
-        img = None
-        mimg = re.search(r'(https://ae\d+\.alicdn\.com/[^"\']+\.(?:jpg|jpeg|png))', window, re.I)
-        if mimg: img = mimg.group(1)
-        items.append({"id": pid, "title": (t or "AliExpress product"), "url": url, "image_url": img or "", "price": ""})
-    # 2) Deduplicate by id while keeping order
+        items.append({"id": pid, "url": url})
+    # dedup
     out, seen = [], set()
     for it in items:
         if it["id"] in seen: continue
         seen.add(it["id"]); out.append(it)
     return out
 
-def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
+def _scrape_item_meta(url, sess):
     try:
-        q = quote_plus(query)
-        urls = [
-            f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc",
-            f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
-            f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc",
-        ]
-        sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",  # deliberately english for simpler DOM
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Connection": "keep-alive",
-            "Referer": "https://www.aliexpress.com/"
-        })
-        total = []
-        for url in urls:
-            try:
-                html = _fetch_html(url, sess)
-                items = _parse_links(html)
-                if items:
-                    total.extend(items)
-            except Exception as e:
-                print(f"[AE][FALLBACK][WARN] {url} -> {e}", flush=True)
-        # Dedup & cut
-        uniq, seen = [], set()
-        for it in total:
-            if it["id"] in seen: continue
-            seen.add(it["id"]); uniq.append(it)
-            if len(uniq) >= limit: break
-        print(f"[AE][FALLBACK] query='{query}' -> {len(uniq)} items", flush=True)
-        return uniq
+        h = _fetch_html(url, sess, timeout=(10,20))
+        # title
+        title = None
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']{5,200})["\']', h, re.I)
+        if m: title = m.group(1)
+        if not title:
+            m = re.search(r'<title>\s*([^<]{5,200})\s*</title>', h, re.I)
+            if m: title = m.group(1)
+        # image
+        img = None
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', h, re.I)
+        if m: img = m.group(1)
+        return {
+            "id": re.search(r'(\d{8,})\.html', url).group(1) if re.search(r'(\d{8,})\.html', url) else str(abs(hash(url))),
+            "title": title or "AliExpress product",
+            "url": url,
+            "image_url": img or "",
+            "price": ""
+        }
     except Exception as e:
-        print(f"[AE][FALLBACK][ERR] {e}", flush=True)
-        return []
+        print(f"[AE][META][WARN] {url} -> {e}", flush=True)
+        return None
+
+def ae_fallback_search(query: str, limit: int = 8, ship_to: str = "IL"):
+    q = quote_plus(query)
+    urls = [
+        f"https://www.aliexpress.com/af/{q}.html?SearchText={q}&g=y&SortType=total_tranpro_desc",
+        f"https://www.aliexpress.com/wholesale?SearchText={q}&g=y&SortType=total_tranpro_desc",
+        f"https://m.aliexpress.com/wholesale/{q}.html?sortType=total_tranpro_desc",
+    ]
+    sess = _sess()
+    total = []
+    # pass 1: try aliexpress search pages
+    for url in urls:
+        try:
+            html = _fetch_html(url, sess)
+            links = _parse_item_links_from_html(html)
+            total.extend(links)
+        except Exception as e:
+            print(f"[AE][FALLBACK][WARN] {url} -> {e}", flush=True)
+    # if empty, pass 2: duckduckgo site search
+    if not total:
+        try:
+            ddg_q = quote_plus(f"site:aliexpress.com/item {query}")
+            ddg_url = f"https://duckduckgo.com/html/?q={ddg_q}"
+            html = _fetch_html(ddg_url, sess, timeout=(10,20))
+            links = _parse_item_links_from_html(html)
+            total.extend(links)
+            if not links:
+                # try m.aliexpress on duckduckgo too
+                ddg_q2 = quote_plus(f"site:m.aliexpress.com/item {query}")
+                ddg_url2 = f"https://duckduckgo.com/html/?q={ddg_q2}"
+                html2 = _fetch_html(ddg_url2, sess, timeout=(10,20))
+                links2 = _parse_item_links_from_html(html2)
+                total.extend(links2)
+        except Exception as e:
+            print(f"[AE][DDG][WARN] ddg -> {e}", flush=True)
+
+    # build items with meta (title/image)
+    uniq_urls, seen = [], set()
+    for it in total:
+        u = it["url"]
+        if u in seen: continue
+        seen.add(u); uniq_urls.append(u)
+        if len(uniq_urls) >= limit: break
+
+    items = []
+    for u in uniq_urls:
+        meta = _scrape_item_meta(u, sess)
+        if meta: items.append(meta)
+
+    print(f"[AE][FALLBACK] query='{query}' -> {len(items)} items", flush=True)
+    return items
 
 # ======= UI =======
 CATEGORIES = [
@@ -293,11 +332,9 @@ def cmd_clear_pending(m):
     if not PENDING_CSV.exists():
         bot.reply_to(m, "לא קיים תור למחיקה.")
         return
-    # Count current
     count_before = pending_count()
-    ensure_pending_csv()  # make sure header exists
+    ensure_pending_csv()
     try:
-        # rewrite header only
         with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["item_id","title","url","price","image_url","ts"])
