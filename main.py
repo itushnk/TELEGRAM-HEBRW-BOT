@@ -38,6 +38,22 @@ HOST = os.getenv("HOST","0.0.0.0")
 WEBHOOK_BASE = os.getenv("WEBHOOK_BASE_URL","")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET","/webhook/secret")
 
+# Normalize webhook path (allow any string, ensure leading slash)
+from urllib.parse import quote
+
+def _normalize_route(p: str) -> str:
+    if not p:
+        return "/webhook/secret"
+    p = p.strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return p
+
+WEBHOOK_ROUTE = _normalize_route(WEBHOOK_SECRET)
+# Encoded version for URL composing (Telegram requires ASCII URL)
+WEBHOOK_ROUTE_ENC = "/" + "/".join(quote(seg, safe="") for seg in WEBHOOK_ROUTE.strip("/").split("/"))
+
+
 BASE_DIR = Path(os.getenv("BOT_DATA_DIR","./data"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 CATEGORIES_PATH = Path(os.getenv("CATEGORIES_PATH", "categories.json"))
@@ -247,7 +263,7 @@ def post_to_channel(text: str):
 def root():
     return "OK v8", 200
 
-@app.route(WEBHOOK_SECRET, methods=["POST"])
+@app.route(WEBHOOK_ROUTE, methods=["POST"])
 def webhook():
     if not bot:
         return "No bot", 500
@@ -292,7 +308,7 @@ def setup_webhook():
         print("[BOOT] Bot token missing")
         return
     if USE_WEBHOOK and WEBHOOK_BASE:
-        wh = WEBHOOK_BASE.rstrip("/") + WEBHOOK_SECRET
+        wh = WEBHOOK_BASE.rstrip("/") + WEBHOOK_ROUTE_ENC
         try:
             bot.remove_webhook()
         except Exception: pass
