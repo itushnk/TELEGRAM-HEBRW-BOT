@@ -64,7 +64,8 @@ def set_locked(val: bool) -> None:
 def ensure_pending_csv():
     if not PENDING_CSV.exists():
         with PENDING_CSV.open("w", newline="", encoding="utf-8") as f:
-            csv.writer(f)..writerow(["item_id","title","url","price","image_url","ts","aff_ok"])
+            w = csv.writer(f)
+            w.writerow(["item_id","title","url","price","image_url","ts","aff_ok"])
 
 def pending_count():
     if not PENDING_CSV.exists(): return 0
@@ -170,7 +171,7 @@ def _aliexpress_api_client():
         lang = lang_map.get(LANG, models.Language.EN)
         cur  = cur_map.get(CURRENCY.upper(), models.Currency.USD)
         api = AliexpressApi(AE_APP_KEY, AE_APP_SECRET, lang, cur, AE_TRACKING_ID, session=None)
-        def make(url: str) -> str|None:
+        def make(url: str):
             try:
                 links = api.get_affiliate_links(url)
                 if links and getattr(links[0], "promotion_link", None):
@@ -183,7 +184,7 @@ def _aliexpress_api_client():
         print(f"[AEAPI][WARN] python-aliexpress-api not available or failed: {e}", flush=True)
         return None
 
-def _s_click_fallback(url: str) -> str|None:
+def _s_click_fallback(url: str):
     # Requires aff_short_key from Portals (optional)
     if not AE_AFF_SHORT_KEY: 
         return None
@@ -192,7 +193,7 @@ def _s_click_fallback(url: str) -> str|None:
 
 AFF_MAKER = _aliexpress_api_client()
 
-def to_affiliate(url: str) -> tuple[str,bool]:
+def to_affiliate(url: str):
     """
     Return (url, aff_ok). Obeys REQUIRE_AFFILIATE:
     - Try official API (tracking id)
