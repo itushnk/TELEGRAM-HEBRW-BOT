@@ -1,4 +1,4 @@
-# autopatch.py - Railway hotfix autopatcher (v7)
+# autopatch.py - Railway hotfix autopatcher (v7-fix)
 # -*- coding: utf-8 -*-
 import os, re, sys
 
@@ -68,7 +68,7 @@ def inject_global_for(varname):
             j = 0
             def _skip(s):
                 t = s.lstrip()
-                return (t == "" or t.startswith("#") or t.startswith('\"\"\"') or t.startswith(\"'''\"))  # noqa
+                return (t == "" or t.startswith("#") or t.startswith('"""') or t.startswith("'''"))
             while j < len(lines) and _skip(lines[j]):
                 j += 1
             lines.insert(j, f"    global {varname}  # [AUTOPATCH]\n")
@@ -208,7 +208,7 @@ else:
 
 # 5) Add /status command (non-invasive) if missing
 if "@bot.message_handler(commands=['status'])" not in src:
-    status_handler = r'''
+    status_handler = '''
 @bot.message_handler(commands=['status'])
 def _autopatch_status(m):
     try:
