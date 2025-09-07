@@ -261,7 +261,11 @@ def post_to_channel(text: str):
 # ===== Routes / Commands =====
 @app.route("/", methods=["GET"])
 def root():
-    return "OK v8", 200
+    return "OK v8b", 200
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return "ok", 200
 
 @app.route(WEBHOOK_ROUTE, methods=["POST"])
 def webhook():
@@ -304,18 +308,34 @@ def cmd_post(m):
     bot.reply_to(m, "נשלח לערוץ ✅")
 
 def setup_webhook():
-    if not bot: 
+    if not bot:
         print("[BOOT] Bot token missing")
         return
+    print(f"[BOOT] USE_WEBHOOK={USE_WEBHOOK} WEBHOOK_BASE={WEBHOOK_BASE!r} CHANNEL={CHANNEL!r}")
     if USE_WEBHOOK and WEBHOOK_BASE:
         wh = WEBHOOK_BASE.rstrip("/") + WEBHOOK_ROUTE_ENC
         try:
             bot.remove_webhook()
-        except Exception: pass
+        except Exception:
+            pass
         ok = bot.set_webhook(url=wh, allowed_updates=["message","callback_query"])
         print("setWebhook:", wh, ok)
     else:
-        print("Webhook disabled; polling not implemented in this minimal build.")
+        print("[BOOT] Webhook disabled/missing base — starting polling mode")
+        def _poll():
+            try:
+                # drop any webhook first just in case
+                try:
+                    bot.remove_webhook()
+                except Exception:
+                    pass
+                bot.infinity_polling(timeout=30, long_polling_timeout=30, allowed_updates=["message","callback_query"])
+            except Exception as e:
+                print("[POLL] exited:", e)
+        import threading
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
+        print("[POLL] Started background polling thread")
 
 def serve():
     from waitress import serve as wserve
